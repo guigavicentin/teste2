@@ -661,36 +661,74 @@ def validate_with_httpx(subdomains: set[str], output_dir: Path,
 
     cmd = [
         "httpx", "-l", str(input_file), "-o", str(output_file),
-        "-silent", "-status-code", "-title", "-tech-detect",
+        # sem -silent: permite que o httpx escreva no arquivo -o corretamente
+        "-status-code", "-title", "-tech-detect",
         "-follow-redirects", "-threads", str(httpx_threads),
         "-timeout", "10", "-json", "-no-color",
     ]
+
+    stdout_lines: list[str] = []
     try:
-        subprocess.run(cmd, timeout=600, check=False)
+        # capture_output=True captura stdout para fallback caso -o saia vazio
+        proc = subprocess.run(cmd, timeout=600, check=False,
+                              capture_output=True, text=True)
+        stdout_lines = proc.stdout.splitlines()
+        # exibe no terminal para acompanhamento em tempo real
+        for ln in stdout_lines:
+            if ln.strip():
+                print(f"  {ln}", flush=True)
     except FileNotFoundError:
         err("httpx não encontrado — probe manual ativado")
         return _fallback_probe(subdomains)
     except subprocess.TimeoutExpired:
         warn("httpx: timeout global — usando resultados parciais")
 
-    alive = []
-    if output_file.exists():
-        for line in output_file.read_text().splitlines():
-            line = line.strip()
-            if not line:
+    # Prioridade: arquivo -o → stdout capturado
+    # Bug de compatibilidade: httpx moderno usa "status_code" (underscore),
+    # versões antigas usavam "status-code" (hífen). Aceitamos ambos.
+    raw_lines: list[str] = []
+    if output_file.exists() and output_file.stat().st_size > 0:
+        raw_lines = output_file.read_text(errors="replace").splitlines()
+        info(f"httpx: lendo {len(raw_lines)} linhas de {output_file.name}")
+    elif stdout_lines:
+        raw_lines = stdout_lines
+        warn(f"httpx: arquivo -o vazio, usando stdout ({len(raw_lines)} linhas)")
+        output_file.write_text("\n".join(raw_lines))
+    else:
+        warn("httpx: sem saída — verifique se o binário está atualizado")
+
+    alive: list[dict] = []
+    for line in raw_lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+            # aceita status_code (novo) ou status-code (legado)
+            status = obj.get("status_code") or obj.get("status-code") or 0
+            if not status:
                 continue
-            try:
-                obj = json.loads(line)
-                if obj.get("status-code", 0):
-                    alive.append({
-                        "url":    obj.get("url", ""),
-                        "status": obj.get("status-code", 0),
-                        "title":  obj.get("title", ""),
-                        "tech":   obj.get("tech", []),
-                    })
-            except Exception:
-                if line.startswith("http"):
-                    alive.append({"url": line, "status": 200, "title": "", "tech": []})
+            url = obj.get("url", "").strip()
+            if not url:
+                continue
+            # tech pode ser list[str] (antigo) ou list[dict] (novo com versão)
+            raw_tech = obj.get("tech", []) or []
+            if raw_tech and isinstance(raw_tech[0], dict):
+                tech_list = [t.get("name", str(t)) for t in raw_tech]
+            else:
+                tech_list = [str(t) for t in raw_tech]
+            alive.append({
+                "url":      url,
+                "status":   int(status),
+                "title":    obj.get("title", ""),
+                "tech":     tech_list,
+                "cdn":      obj.get("cdn", False),
+                "cdn_name": obj.get("cdn_name", ""),
+            })
+        except (json.JSONDecodeError, ValueError):
+            if line.startswith("http"):
+                alive.append({"url": line, "status": 200, "title": "",
+                              "tech": [], "cdn": False, "cdn_name": ""})
 
     ok(f"Hosts vivos: {len(alive)}")
     (output_dir / "alive.txt").write_text("\n".join(h["url"] for h in alive))
@@ -859,8 +897,10 @@ Interactsh:
 
     def scan_host(host: dict):
         url = host["url"]
-        tech_str = ", ".join(host["tech"]) if host["tech"] else "—"
-        print(f"\n{BO}[>]{RST} {url}  {DIM}[{host['status']}] {host['title'][:50]}  tech:{tech_str}{RST}")
+        raw_tech = host.get("tech", []) or []
+        tech_str = ", ".join(raw_tech) if raw_tech else "—"
+        cdn_info = f"  CDN:{host.get('cdn_name','')}" if host.get("cdn") else ""
+        print(f"\n{BO}[>]{RST} {url}  {DIM}[{host['status']}] {host.get('title','')[:50]}  tech:{tech_str}{cdn_info}{RST}")
 
         local: list[dict] = []
         if not args.skip_ssrf:
