@@ -222,47 +222,80 @@ def validate_with_httpx(
         "httpx",
         "-l",        str(input_file),
         "-o",        str(output_file),
-        "-silent",
+        # sem -silent: deixa o httpx escrever no stdout normalmente;
+        # o arquivo -o receberá as linhas JSON independentemente
         "-status-code",
         "-title",
         "-tech-detect",
         "-follow-redirects",
         "-threads",  str(httpx_threads),
         "-timeout",  str(timeout),
-        "-json",                     # saída JSON por linha
+        "-json",
         "-no-color",
     ]
 
+    stdout_lines: list[str] = []
     try:
-        subprocess.run(cmd, timeout=600, check=False)
+        # Captura stdout E grava em -o simultaneamente
+        proc = subprocess.run(cmd, timeout=600, check=False,
+                              capture_output=True, text=True)
+        stdout_lines = proc.stdout.splitlines()
+        # Imprime no terminal para o usuário acompanhar
+        for l in stdout_lines:
+            if l.strip():
+                print(f"  {l}", flush=True)
     except subprocess.TimeoutExpired:
         warn("httpx: timeout global — usando resultados parciais")
     except FileNotFoundError:
         err("httpx não encontrado — instale: go install github.com/projectdiscovery/httpx/cmd/httpx@latest")
         return _fallback_probe(subdomains)
 
-    # Parse JSON lines
+    # ── Parse JSON lines ──────────────────────────────────────────
+    # Prioridade: arquivo -o → stdout capturado
+    # httpx moderno: campo "status_code" (underscore)
+    # httpx legado:  campo "status-code" (hífen)
     alive: list[dict] = []
-    if output_file.exists():
-        import json
-        for line in output_file.read_text().splitlines():
-            line = line.strip()
-            if not line:
+    raw_lines: list[str] = []
+
+    if output_file.exists() and output_file.stat().st_size > 0:
+        raw_lines = output_file.read_text(errors="replace").splitlines()
+        info(f"httpx: lendo {len(raw_lines)} linhas de {output_file.name}")
+    elif stdout_lines:
+        # arquivo vazio mas stdout tem dados — usa o stdout diretamente
+        raw_lines = stdout_lines
+        warn(f"httpx: arquivo -o vazio, usando stdout ({len(raw_lines)} linhas)")
+        # salva no arquivo para referência futura
+        output_file.write_text("\n".join(raw_lines))
+    else:
+        warn("httpx: sem saída — verifique se o binário está atualizado")
+
+    import json as _json
+    for line in raw_lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = _json.loads(line)
+            # aceita status_code (novo) ou status-code (legado)
+            status = obj.get("status_code") or obj.get("status-code") or 0
+            if not status:
                 continue
-            try:
-                obj = json.loads(line)
-                status = obj.get("status-code", 0)
-                if status and status not in [0]:
-                    alive.append({
-                        "url":    obj.get("url", ""),
-                        "status": status,
-                        "title":  obj.get("title", ""),
-                        "tech":   obj.get("tech", []),
-                    })
-            except json.JSONDecodeError:
-                # linha pode ser URL pura (httpx sem -json)
-                if line.startswith("http"):
-                    alive.append({"url": line, "status": 200, "title": "", "tech": []})
+            url = obj.get("url", "").strip()
+            if not url:
+                continue
+            alive.append({
+                "url":    url,
+                "status": int(status),
+                "title":  obj.get("title", ""),
+                "tech":   obj.get("tech", []),
+                "cdn":    obj.get("cdn", False),
+                "cdn_name": obj.get("cdn_name", ""),
+            })
+        except (_json.JSONDecodeError, ValueError):
+            # linha pode ser URL pura em versões antigas do httpx
+            if line.startswith("http"):
+                alive.append({"url": line, "status": 200, "title": "", "tech": [],
+                               "cdn": False, "cdn_name": ""})
 
     ok(f"Hosts vivos: {len(alive)}")
 
@@ -727,8 +760,13 @@ Exemplos:
 
     for host in alive_hosts:
         url = host["url"]
-        tech_str = ", ".join(host["tech"]) if host["tech"] else "—"
-        print(f"\n{BO}[>]{RST} {url}  {DIM}[{host['status']}] {host['title'][:50]}  tech: {tech_str}{RST}")
+        raw_tech = host.get("tech", []) or []
+        if raw_tech and isinstance(raw_tech[0], dict):
+            tech_str = ", ".join(t.get("name", str(t)) for t in raw_tech)
+        else:
+            tech_str = ", ".join(str(t) for t in raw_tech) if raw_tech else "—"
+        cdn_info = f"  CDN:{host.get('cdn_name','')}" if host.get("cdn") else ""
+        print(f"\n{BO}[>]{RST} {url}  {DIM}[{host['status']}] {host.get('title','')[:50]}  tech:{tech_str}{cdn_info}{RST}")
 
         findings = scan_target(url, args.threads, args.oob)
         all_findings[url] = findings
