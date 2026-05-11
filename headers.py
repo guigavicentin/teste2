@@ -443,11 +443,29 @@ def scan_ssrf(url: str, oob_domain: str | None) -> list[dict]:
                         evidence     = f"redirect para OOB: {loc}"
                         found = True
 
-            # 4. OOB — payload foi enviado; confirmação vem do Interactsh
-            if pl["type"].startswith("OOB") and not found:
-                finding_type = "SSRF_OOB_DISPATCHED"
-                evidence     = f"payload OOB disparado — marker: {marker}"
-                found = True
+            # 4. OOB — payload disparado silenciosamente.
+            # NÃO gera HIT nem finding aqui: a confirmação é exclusiva
+            # do painel Interactsh. O cURL fica gravado no JSON/MD final.
+            if pl["type"].startswith("OOB"):
+                oob_curl = build_curl(url, {header_template: value}, pl["note"])
+                # guarda no JSON para referência, sem exibir como HIT
+                findings.append({
+                    "url":        url,
+                    "type":       "SSRF_OOB_DISPATCHED",
+                    "header":     header_template,
+                    "payload":    value,
+                    "pl_type":    pl["type"],
+                    "pl_note":    pl["note"],
+                    "confidence": "OOB_PENDING",
+                    "evidence":   f"payload enviado — confirme marker '{marker}' no Interactsh",
+                    "status":     resp["status"],
+                    "marker":     marker,
+                    "oob_domain": oob_domain or "",
+                    "curl":       oob_curl,
+                })
+                # log discreto — sem [HIT], sem cor de alerta
+                print(f"  {DIM}[oob]{RST} {header_template} → {pl['type']} ({pl['note']}) @ {url}", flush=True)
+                continue   # não cai no bloco "if found" abaixo
 
             if found:
                 f = {
@@ -563,11 +581,25 @@ def scan_cache_poison(url: str, oob_domain: str | None) -> list[dict]:
                         evidence     = f"{rh}: {rv} — cache HIT na request envenenada"
                         found = True
 
-            # 5. OOB dispatched — confiança média, aguarda callback
+            # 5. OOB dispatched — payload enviado silenciosamente.
+            # Confirmação exclusiva via painel Interactsh — sem HIT no terminal.
             if pl["type"].startswith("OOB") and not found:
-                finding_type = "CACHE_OOB_DISPATCHED"
-                evidence     = f"payload OOB enviado — marker: {marker}"
-                found = True
+                findings.append({
+                    "url":        url,
+                    "type":       "CACHE_OOB_DISPATCHED",
+                    "header":     header_template,
+                    "payload":    value,
+                    "pl_type":    pl["type"],
+                    "pl_note":    pl["note"],
+                    "confidence": "OOB_PENDING",
+                    "evidence":   f"payload enviado — confirme marker '{marker}' no Interactsh",
+                    "status":     poison_resp["status"],
+                    "marker":     marker,
+                    "oob_domain": oob_domain or "",
+                    "curl":       build_curl(test_url, {header_template: value}, pl["note"]),
+                })
+                print(f"  {DIM}[oob]{RST} {header_template} → {pl['type']} ({pl['note']}) @ {url}", flush=True)
+                continue
 
             if found:
                 f = {
@@ -758,20 +790,19 @@ def _fallback_probe(subdomains: set[str]) -> list[dict]:
 # ══════════════════════════════════════════════════════════════════
 
 def print_finding(f: dict, idx: int):
+    # OOB_PENDING nunca é exibido como finding no terminal
+    if f["confidence"] == "OOB_PENDING":
+        return
     col = {"CRITICAL": R, "HIGH": M, "MEDIUM": Y}.get(
         f["confidence"].split()[0], C
     )
-    print(f"\n{BO}{'─'*62}{RST}")
+    print(f"\n{BO}{chr(9472)*62}{RST}")
     print(f"{BO}[#{idx}] {col}{f['confidence']}{RST} — {f['type']}")
-    print(f"  URL     : {f['url']}")
-    print(f"  Header  : {f['header']}")
-    print(f"  Payload : {f['payload'][:100]}")
-    print(f"  Nota    : {f['pl_note']}")
+    print(f"  URL      : {f['url']}")
+    print(f"  Header   : {f['header']}")
+    print(f"  Payload  : {f['payload'][:100]}")
+    print(f"  Nota     : {f['pl_note']}")
     print(f"  Evidência: {f['evidence']}")
-    if f.get("oob_domain"):
-        print(f"\n  {BO}Interactsh — aguarde callback:{RST}")
-        print(f"    marker : {f['marker']}")
-        print(f"    cmd    : interactsh-client -s {f['oob_domain']}")
     print(f"\n  {BO}cURL PoC:{RST}")
     for line in f["curl"].split("\n"):
         print(f"    {line}")
@@ -924,30 +955,47 @@ Interactsh:
                 err(f"Erro em {futures[f]['url']}: {e}")
 
     # ── Sumário ───────────────────────────────────────────────────
-    print(f"\n{BO}{'═'*62}{RST}")
+    # Separa findings reais (detectáveis na response) dos OOB pendentes
+    real_findings = [f for f in all_findings if f["confidence"] != "OOB_PENDING"]
+    oob_findings  = [f for f in all_findings if f["confidence"] == "OOB_PENDING"]
+
+    print(f"\n{BO}{chr(9552)*62}{RST}")
     print(f"{BO}SUMÁRIO{RST}")
-    print(f"  Hosts escaneados : {len(alive_hosts)}")
-    print(f"  Total findings   : {len(all_findings)}")
+    print(f"  Hosts escaneados  : {len(alive_hosts)}")
+    print(f"  Findings reais    : {len(real_findings)}  {DIM}(detectados na response){RST}")
+    print(f"  OOB disparados    : {len(oob_findings)}  {DIM}(confirme no painel Interactsh){RST}")
 
-    by_conf: dict[str, int] = {}
-    by_type: dict[str, int] = {}
-    for f in all_findings:
-        c = f["confidence"].split()[0]
-        by_conf[c] = by_conf.get(c, 0) + 1
-        by_type[f["type"]] = by_type.get(f["type"], 0) + 1
+    if real_findings:
+        print()
+        by_conf: dict[str, int] = {}
+        by_type: dict[str, int] = {}
+        for f in real_findings:
+            c = f["confidence"].split()[0]
+            by_conf[c] = by_conf.get(c, 0) + 1
+            by_type[f["type"]] = by_type.get(f["type"], 0) + 1
 
-    for c in ["CRITICAL", "HIGH", "MEDIUM", "LOW"]:
-        if c in by_conf:
-            col = {"CRITICAL": R, "HIGH": M, "MEDIUM": Y, "LOW": C}[c]
-            print(f"  {col}{c}{RST}: {by_conf[c]}")
+        for c in ["CRITICAL", "HIGH", "MEDIUM", "LOW"]:
+            if c in by_conf:
+                col = {"CRITICAL": R, "HIGH": M, "MEDIUM": Y, "LOW": C}[c]
+                print(f"  {col}{c}{RST}: {by_conf[c]}")
+        for t, n in sorted(by_type.items()):
+            print(f"    {DIM}{t}: {n}{RST}")
+    else:
+        print(f"  {DIM}Nenhum finding detectável na response — aguarde callbacks OOB{RST}")
 
-    if args.oob:
-        oob_n = sum(1 for f in all_findings if "OOB" in f["type"])
-        print(f"\n  OOB disparados: {oob_n} — confirme em: interactsh-client -s {args.oob}")
+    if args.oob and oob_findings:
+        # agrupa markers únicos por host para exibição limpa
+        markers_by_host: dict[str, str] = {}
+        for f in oob_findings:
+            markers_by_host.setdefault(f["url"], f["marker"])
+        print(f"\n  {DIM}Markers OOB enviados:{RST}")
+        for u, mk in sorted(markers_by_host.items()):
+            print(f"    {DIM}{mk}  →  {u}{RST}")
+        print(f"\n  {Y}Verifique:{RST} interactsh-client -s {args.oob}")
 
     if all_findings:
         save_report(all_findings, odir)
-    print(f"{'═'*62}")
+    print(f"{chr(9552)*62}")
 
 
 if __name__ == "__main__":
