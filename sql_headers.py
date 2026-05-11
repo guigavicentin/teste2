@@ -524,18 +524,26 @@ def test_time_based(url: str, header: str, baseline: dict) -> list[dict]:
 
 
 def test_oob(url: str, header: str, oob_domain: str) -> list[dict]:
+    """
+    Dispara payloads OOB silenciosamente.
+    NÃO gera [HIT] — confirmação é exclusiva do painel Interactsh.
+    Retorna entradas com confidence=OOB_PENDING para o JSON/MD final.
+    """
     findings = []
     marker   = uuid.uuid4().hex[:8]
     for entry in build_oob_payloads(oob_domain, f"{marker}-{_slugify(header)}"):
         resp = request_once(url, headers={header: entry["payload"]}, timeout=20)
         if not resp["ok"] or resp["status"] in IGNORED_STATUS:
             continue
+        # log discreto sem cor de alerta
+        print(f"  {DIM}[oob]{RST} {header} → {entry['db']} {entry['method'].upper()} @ {url}",
+              flush=True)
         findings.append({
             "type":       "OOB",
             "header":     header,
             "payload":    entry["payload"],
-            "confidence": "CRITICAL",
-            "reason":     f"{entry['db']} {entry['method'].upper()} OOB — marker: {marker}",
+            "confidence": "OOB_PENDING",
+            "reason":     f"{entry['db']} {entry['method'].upper()} — confirme marker '{marker}' no Interactsh",
             "marker":     marker,
             "oob_domain": oob_domain,
             "curl":       build_curl(url, header, entry["payload"]),
@@ -576,6 +584,9 @@ def scan_target(url: str, threads: int, oob_domain: str | None) -> list[dict]:
                 with lock:
                     results.extend(res)
                 for item in res:
+                    # OOB_PENDING nunca é exibido como [HIT] — já foi logado em test_oob
+                    if item["confidence"] == "OOB_PENDING":
+                        continue
                     hit(f"{item['confidence']:8s} | {futures[f]:35s} | {item['type']} | {url}")
 
             if done % 15 == 0 or done == total:
@@ -593,16 +604,15 @@ def scan_target(url: str, threads: int, oob_domain: str | None) -> list[dict]:
 SVCOL = {"HIGH": R, "MEDIUM": Y, "CRITICAL": M, "LOW": C}
 
 def print_finding(item: dict, idx: int, url: str):
+    # OOB_PENDING não é exibido no terminal — aparece só no JSON/MD final
+    if item["confidence"] == "OOB_PENDING":
+        return
     col = SVCOL.get(item["confidence"], C)
-    print(f"\n{BO}{'─'*60}{RST}")
+    print(f"\n{BO}{chr(9472)*60}{RST}")
     print(f"{BO}[#{idx}] {col}{item['confidence']}{RST} — {item['type']} @ {url}")
     print(f"  Header  : {item['header']}")
     print(f"  Payload : {item['payload'][:110]}")
     print(f"  Motivo  : {item['reason']}")
-    if item["type"] == "OOB":
-        print(f"\n  {BO}Interactsh — aguarde callback:{RST}")
-        print(f"    marker     : {item['marker']}")
-        print(f"    comando    : interactsh-client -s {item['oob_domain']}")
     print(f"\n  {BO}cURL PoC:{RST}")
     for line in item["curl"].split("\n"):
         print(f"    {line}")
@@ -779,25 +789,47 @@ Exemplos:
             info(f"Sem findings em {url}")
 
     # ── SUMÁRIO FINAL ─────────────────────────────────────────────
-    print(f"\n{BO}{'═'*60}{RST}")
-    print(f"{BO}SUMÁRIO FINAL{RST}")
-    print(f"{'═'*60}")
-    print(f"  Domínio   : {args.domain}")
-    print(f"  Hosts vivos : {len(alive_hosts)}")
-    print(f"  Findings  : {grand_total}")
-    if args.oob:
-        oob_total = sum(1 for v in all_findings.values() for f in v if f["type"] == "OOB")
-        print(f"  OOB disparados : {oob_total}  →  confirme em interactsh-client")
+    # Separa findings reais (detectados na response) de OOB pendentes
+    all_flat     = [f for v in all_findings.values() for f in v]
+    real_findings = [f for f in all_flat if f["confidence"] != "OOB_PENDING"]
+    oob_findings  = [f for f in all_flat if f["confidence"] == "OOB_PENDING"]
 
-    by_type: dict[str, int] = {}
-    for findings in all_findings.values():
-        for f in findings:
+    print(f"\n{BO}{chr(9552)*60}{RST}")
+    print(f"{BO}SUMÁRIO FINAL{RST}")
+    print(f"  Domínio          : {args.domain}")
+    print(f"  Hosts escaneados : {len(alive_hosts)}")
+    print(f"  Findings reais   : {len(real_findings)}  {DIM}(detectados na response){RST}")
+    print(f"  OOB disparados   : {len(oob_findings)}  {DIM}(confirme no painel Interactsh){RST}")
+
+    if real_findings:
+        print()
+        by_conf: dict[str, int] = {}
+        by_type: dict[str, int] = {}
+        for f in real_findings:
+            c = f["confidence"]
+            by_conf[c] = by_conf.get(c, 0) + 1
             by_type[f["type"]] = by_type.get(f["type"], 0) + 1
-    for t, n in sorted(by_type.items()):
-        print(f"    {t}: {n}")
+        col_map = {"HIGH": R, "MEDIUM": Y, "LOW": C}
+        for c, n in sorted(by_conf.items()):
+            col = col_map.get(c, RST)
+            print(f"  {col}{c}{RST}: {n}")
+        for t, n in sorted(by_type.items()):
+            print(f"    {DIM}{t}: {n}{RST}")
+    else:
+        print(f"  {DIM}Nenhum finding detectável na response — aguarde callbacks OOB{RST}")
+
+    if args.oob and oob_findings:
+        # markers únicos por host
+        markers_by_host: dict[str, str] = {}
+        for f in oob_findings:
+            markers_by_host.setdefault(f["url"], f["marker"])
+        print(f"\n  {DIM}Markers OOB enviados:{RST}")
+        for u, mk in sorted(markers_by_host.items()):
+            print(f"    {DIM}{mk}  →  {u}{RST}")
+        print(f"\n  {Y}Verifique:{RST} interactsh-client -s {args.oob}")
 
     save_report(all_findings, odir)
-    print(f"{'═'*60}")
+    print(chr(9552)*60)
 
 
 if __name__ == "__main__":
