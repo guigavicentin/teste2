@@ -14,6 +14,7 @@ import json
 import sys
 from urllib.parse import urlparse
 from datetime import datetime
+from pathlib import Path
 
 try:
     from playwright.async_api import async_playwright
@@ -52,7 +53,6 @@ async def crawl(url: str, timeout: int, wait: int, headless: bool, output_json: 
             path    = parsed.path.lower()
 
             if ".js" in path and req_url not in seen:
-                # filtra query strings irrelevantes para o path mas mantém a URL completa
                 seen.add(req_url)
                 js_files.append({
                     "url":        req_url,
@@ -74,7 +74,6 @@ async def crawl(url: str, timeout: int, wait: int, headless: bool, output_json: 
             print(f"[AVISO] networkidle timeout: {e}")
             print("        Continuando com o que foi capturado…")
 
-        # Espera adicional para JS assíncrono / lazy load
         if wait > 0:
             await asyncio.sleep(wait)
 
@@ -95,16 +94,87 @@ async def crawl(url: str, timeout: int, wait: int, headless: bool, output_json: 
             "own_domain":   own,
             "third_party":  thirds,
         }
-        with open(output_json, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        print(f"\n💾  Resultado salvo em: {output_json}")
+        _merge_json(output_json, data)
 
     return js_files
 
 
+async def crawl_many(urls: list[str], timeout: int, wait: int, headless: bool, output_json: str | None):
+    """Processa uma lista de URLs sequencialmente."""
+    all_results = []
+    total = len(urls)
+
+    for idx, url in enumerate(urls, 1):
+        print(f"\n{'═' * 70}")
+        print(f"  [{idx}/{total}] Processando: {url}")
+        print(f"{'═' * 70}")
+        try:
+            js_files = await crawl(url, timeout, wait, headless, output_json)
+            all_results.append({"url": url, "js_count": len(js_files), "status": "ok"})
+        except Exception as e:
+            print(f"[ERRO] Falha ao processar {url}: {e}")
+            all_results.append({"url": url, "js_count": 0, "status": f"erro: {e}"})
+
+    # ── Resumo final ─────────────────────────────────────────────────────────
+    print(f"\n{'═' * 70}")
+    print(f"  📋  RESUMO FINAL — {total} domínio(s) processado(s)")
+    print(f"{'═' * 70}")
+    for r in all_results:
+        status_icon = "✅" if r["status"] == "ok" else "❌"
+        print(f"  {status_icon}  {r['url']:<50}  {r['js_count']} JS")
+    print(f"{'═' * 70}\n")
+
+
 # ─────────────────────────────────────────────
-#  Formatação
+#  Helpers
 # ─────────────────────────────────────────────
+
+def _merge_json(filepath: str, new_data: dict):
+    """Acumula resultados num único arquivo JSON (lista de crawls)."""
+    path = Path(filepath)
+    existing = []
+    if path.exists():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = json.load(f)
+                existing = content if isinstance(content, list) else [content]
+        except Exception:
+            pass
+
+    existing.append(new_data)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(existing, f, indent=2, ensure_ascii=False)
+    print(f"\n💾  Resultado acumulado em: {filepath}")
+
+
+def load_urls_from_file(filepath: str) -> list[str]:
+    """
+    Lê um arquivo de domínios/URLs (um por linha).
+    Linhas vazias e comentários (#) são ignorados.
+    Domínios sem protocolo recebem https:// automaticamente.
+    """
+    path = Path(filepath)
+    if not path.exists():
+        print(f"[ERRO] Arquivo não encontrado: {filepath}")
+        sys.exit(1)
+
+    urls = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if not line.startswith(("http://", "https://")):
+                line = "https://" + line
+            urls.append(line)
+
+    if not urls:
+        print(f"[ERRO] Nenhum domínio válido encontrado em: {filepath}")
+        sys.exit(1)
+
+    print(f"📄  {len(urls)} domínio(s) carregado(s) de '{filepath}'")
+    return urls
+
 
 def _print_results(url, all_js, own, thirds):
     sep = "─" * 70
@@ -139,16 +209,38 @@ def build_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Exemplos:
+  # URL única
   python js_live_crawler.py https://example.com
+
+  # URL única com saída JSON
   python js_live_crawler.py https://example.com -w 3 -o result.json
-  python js_live_crawler.py https://example.com --no-headless   # abre o browser visível
+
+  # Arquivo com lista de domínios
+  python js_live_crawler.py -f dominios.txt
+
+  # Arquivo com lista + saída JSON acumulada
+  python js_live_crawler.py -f dominios.txt -o result.json
+
+  # Abre o browser visível (útil para debug)
+  python js_live_crawler.py https://example.com --no-headless
+
+Formato do arquivo de domínios (dominios.txt):
+  # comentários são ignorados
+  example.com
+  https://outro.com
+  http://terceiro.com.br
         """,
     )
-    p.add_argument("url",               help="URL alvo (ex: https://example.com)")
-    p.add_argument("-t", "--timeout",   type=int, default=30,   help="Timeout de navegação em segundos (padrão: 30)")
-    p.add_argument("-w", "--wait",      type=int, default=2,    help="Segundos extras após networkidle (padrão: 2)")
-    p.add_argument("-o", "--output",    default=None,           help="Salvar resultado em JSON (ex: -o result.json)")
-    p.add_argument("--no-headless",     action="store_true",    help="Abre o browser visível (útil para debug)")
+
+    # Origem: URL direta OU arquivo — pelo menos um é obrigatório
+    source = p.add_mutually_exclusive_group(required=True)
+    source.add_argument("url",   nargs="?",       help="URL alvo (ex: https://example.com)")
+    source.add_argument("-f", "--file",            help="Arquivo com domínios/URLs, um por linha")
+
+    p.add_argument("-t", "--timeout", type=int, default=30,  help="Timeout de navegação em segundos (padrão: 30)")
+    p.add_argument("-w", "--wait",    type=int, default=2,   help="Segundos extras após networkidle (padrão: 2)")
+    p.add_argument("-o", "--output",  default=None,          help="Salvar resultado em JSON (ex: -o result.json)")
+    p.add_argument("--no-headless",   action="store_true",   help="Abre o browser visível (útil para debug)")
     return p
 
 
@@ -156,20 +248,34 @@ def main():
     parser = build_parser()
     args   = parser.parse_args()
 
-    # Garante protocolo
-    url = args.url
-    if not url.startswith(("http://", "https://")):
-        url = "https://" + url
+    headless = not args.no_headless
 
-    asyncio.run(
-        crawl(
-            url        = url,
-            timeout    = args.timeout,
-            wait       = args.wait,
-            headless   = not args.no_headless,
-            output_json= args.output,
+    if args.file:
+        # ── Modo arquivo ────────────────────────────────────────────────────
+        urls = load_urls_from_file(args.file)
+        asyncio.run(
+            crawl_many(
+                urls        = urls,
+                timeout     = args.timeout,
+                wait        = args.wait,
+                headless    = headless,
+                output_json = args.output,
+            )
         )
-    )
+    else:
+        # ── Modo URL única ──────────────────────────────────────────────────
+        url = args.url
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+        asyncio.run(
+            crawl(
+                url         = url,
+                timeout     = args.timeout,
+                wait        = args.wait,
+                headless    = headless,
+                output_json = args.output,
+            )
+        )
 
 
 if __name__ == "__main__":
