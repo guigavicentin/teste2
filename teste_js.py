@@ -950,17 +950,25 @@ def httpx_probe(open_ports: dict[str, list[int]], cfg: dict,
                 logger: logging.Logger) -> list[str]:
     """
     Monta URLs host:porta para cada porta aberta e valida com httpx.
+    Garante que 80 e 443 sempre sejam testados como fallback.
     Retorna lista de URLs ativas.
     """
     logger.info("═══ httpx — validação de hosts ativos ═══")
 
-    # Monta candidatos: https primeiro, http como fallback
-    candidates: list[str] = []
+    HTTPS_PORTS = {443, 8443, 9443, 4443, 6443, 2076, 10000}
+
+    candidates: set[str] = set()
     for host, ports in open_ports.items():
-        use_ports = ports if ports else [80, 443]
-        for port in use_ports:
-            scheme = "https" if port in (443, 8443, 9443, 4443, 6443, 2076, 10000) else "http"
-            candidates.append(f"{scheme}://{host}:{port}")
+        # Sempre testa 80 e 443 independente do nmap
+        base_ports = set(ports) | {80, 443}
+        for port in base_ports:
+            scheme = "https" if port in HTTPS_PORTS else "http"
+            candidates.add(f"{scheme}://{host}:{port}")
+            # Para porta 443 também testa sem porta explícita (SNI)
+            if port == 443:
+                candidates.add(f"https://{host}")
+            if port == 80:
+                candidates.add(f"http://{host}")
 
     if not candidates:
         logger.warning("Nenhum candidato para httpx.")
@@ -974,6 +982,9 @@ def httpx_probe(open_ports: dict[str, list[int]], cfg: dict,
         _write(cfg["alive_file"], candidates, logger)
         return candidates
 
+    candidate_list = sorted(candidates)
+    logger.info("[httpx] testando %d candidatos…", len(candidate_list))
+
     try:
         result = subprocess.run(
             ["httpx",
@@ -981,27 +992,18 @@ def httpx_probe(open_ports: dict[str, list[int]], cfg: dict,
              "-mc", "200,201,204,301,302,307,308,401,403",
              "-threads", "50",
              "-timeout", "8",
-             "-title",
-             "-status-code",
-             "-follow-redirects",
-             "-o", str(cfg["alive_file"])],
-            input="\n".join(candidates) + "\n",
+             "-follow-redirects"],
+            input="\n".join(candidate_list) + "\n",
             capture_output=True, text=True, timeout=600,
         )
-        alive = [u.strip() for u in result.stdout.splitlines() if u.strip()]
+        # Sem -title/-status-code: cada linha é a URL limpa
+        urls_clean = [u.strip() for u in result.stdout.splitlines() if u.strip().startswith("http")]
     except subprocess.TimeoutExpired:
         logger.warning("Timeout no httpx — usando candidatos sem filtrar.")
-        alive = candidates
+        urls_clean = candidate_list
     except Exception as e:
         logger.error("Erro no httpx: %s", e)
-        alive = candidates
-
-    # O httpx com -title e -status-code adiciona sufixos — extrai só a URL
-    urls_clean: list[str] = []
-    for line in alive:
-        m = re.match(r'(https?://[^\s]+)', line)
-        if m:
-            urls_clean.append(m.group(1))
+        urls_clean = candidate_list
 
     _write(cfg["alive_file"], urls_clean, logger)
     logger.info("[httpx] hosts ativos: %d", len(urls_clean))
@@ -1388,7 +1390,12 @@ Exemplos:
 
 def main() -> None:
     args   = parse_args()
-    domain = args.domain.strip().lstrip("https://").lstrip("http://").rstrip("/")
+    domain = args.domain.strip()
+    for _pfx in ("https://", "http://"):
+        if domain.startswith(_pfx):
+            domain = domain[len(_pfx):]
+            break
+    domain = domain.rstrip("/")
     cfg    = make_cfg(domain, args)
     logger = setup_logging(cfg["log_file"])
     stats: dict[str, int] = {}
