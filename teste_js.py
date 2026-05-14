@@ -153,6 +153,13 @@ SECRET_SEVERITY: dict[str, str] = {
     "bearer_token":          "LOW",
     "password_field":        "LOW",
     "bcrypt_hash":           "LOW",
+    "basic_auth_hardcoded":  "HIGH",
+    "basic_auth_btoa":       "HIGH",
+    "basic_auth_b64_raw":    "HIGH",
+    "hardcoded_credentials": "HIGH",
+    "auth_header_hardcoded": "MEDIUM",
+    "btoa_decoded":          "HIGH",
+    "btoa_creds":            "HIGH",
 }
 _SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "UNKNOWN": 4}
 
@@ -325,12 +332,24 @@ def _secret_patterns() -> dict[str, re.Pattern]:
         "generic_secret":        _rx(r'(?:client[_-]?secret|app[_-]?secret)["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-/+=]{20,})["\']', re.I),
         "bearer_token":          _rx(r'Authorization:\s*Bearer\s+([A-Za-z0-9_\-\.]{20,})', re.I),
         "password_field":        _rx(r'(?:password|passwd|senha)["\']?\s*[:=]\s*["\']([^"\']{8,})["\']', re.I),
+        # ── Basic Auth / credenciais hardcoded ──────────────────────────────
+        # Caso: Authorization:"Basic "+btoa("admin:123456") — Angular/React/Vue
+        "basic_auth_btoa":       _rx(r'Basic\s*["\']?\s*\+\s*btoa\s*\(\s*["\']([^"\']{3,100})["\']\s*\)', re.I),
+        # btoa("user:pass") standalone — decodificável via base64
+        "btoa_creds":            _rx(r'\bbtoa\s*\(\s*["\']([^"\']{2,100})["\']\s*\)', re.I),
+        # Authorization: "Basic dXNlcjpwYXNz" — base64 literal já embutido
+        "basic_auth_b64_raw":    _rx(r'(?:Authorization|authorization)\s*[:\s=]+["\']?\s*Basic\s+([A-Za-z0-9+/]{8,}={0,2})', re.I),
+        # username + password juntos na mesma região do código
+        "hardcoded_credentials": _rx(r'(?:username|user|login|usr)\s*[:=]\s*["\']([^"\']{2,50})["\']\s{0,5}.{0,80}(?:password|passwd|pass|pwd|senha)\s*[:=]\s*["\']([^"\']{2,})["\']', re.I),
+        # Authorization como chave de objeto JS com valor Basic
+        "auth_header_hardcoded": _rx(r'["\']Authorization["\']\s*:\s*["\']Basic\s+([A-Za-z0-9+/]{8,}={0,2})["\']', re.I),
     }
 
 
 _GENERIC_PATTERNS = frozenset({
     "generic_api_key", "generic_token", "generic_secret",
     "bearer_token", "password_field",
+    "auth_header_hardcoded",
 })
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -628,6 +647,32 @@ def analyze_js(content: str, url: str, cfg: dict, logger: logging.Logger) -> int
     for obf in scan_obfuscation(content, url, logger):
         _save_secret(obf, cfg)
         found += 1
+
+    # ── Decodificação de btoa() ──────────────────────────────────────────────
+    # Qualquer btoa("...") encontrado: decodifica e anota o valor em claro
+    _btoa_re = re.compile(r'\bbtoa\s*\(\s*["\'](.*?)["\'\']\s*\)', re.I)
+    for bm in _btoa_re.finditer(content):
+        raw_val = bm.group(1)          # ex: "admin:123456"
+        ctx     = content[max(0, bm.start()-80):min(len(content), bm.end()+80)].replace("\n", " ")
+        finding = {
+            "type":    "btoa_decoded",
+            "value":   raw_val,
+            "url":     url,
+            "context": ctx,
+        }
+        if _save_secret(finding, cfg):
+            # Tenta decodificar se já for base64 (às vezes o btoa já foi avaliado)
+            decoded = ""
+            try:
+                import base64 as _b64mod
+                decoded = _b64mod.b64decode(raw_val + "==").decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            if decoded and decoded != raw_val:
+                logger.warning("[!!!] btoa decoded → '%s' (claro: '%s') | %s", raw_val, decoded, url)
+            else:
+                logger.warning("[!!!] btoa hardcoded → '%s' | %s", raw_val, url)
+            found += 1
 
     # ── Endpoints ─────────────────────────────────────────────────────────────
     for label, pattern, method_hint in cfg["endpoint_patterns"]:
