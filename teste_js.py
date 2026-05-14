@@ -799,8 +799,22 @@ async def live_crawl_all(targets: list[str], cfg: dict,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def enum_subdomains(domain: str, cfg: dict, logger: logging.Logger) -> set[str]:
+    import os
     subs: set[str] = set()
     logger.info("═══ Enumeração de subdomínios ═══")
+
+    chaos_key    = os.environ.get("CHAOS_KEY", "").strip()
+    github_token = os.environ.get("GITHUB_TOKEN", "").strip()
+
+    if chaos_key:
+        logger.info("[chaos] CHAOS_KEY presente ✓")
+    else:
+        logger.warning("[chaos] CHAOS_KEY não definida — export CHAOS_KEY='sua_chave'")
+
+    if github_token:
+        logger.info("[github-subdomains] GITHUB_TOKEN presente ✓")
+    else:
+        logger.warning("[github-subdomains] GITHUB_TOKEN não definido — export GITHUB_TOKEN='seu_token'")
 
     # subfinder
     if tool_ok("subfinder"):
@@ -809,7 +823,7 @@ def enum_subdomains(domain: str, cfg: dict, logger: logging.Logger) -> set[str]:
         subs.update(lines)
         logger.info("[subfinder] %d subs", len(lines))
     else:
-        logger.warning("subfinder não encontrado")
+        logger.warning("subfinder não encontrado  |  go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest")
 
     # assetfinder
     if tool_ok("assetfinder"):
@@ -820,21 +834,33 @@ def enum_subdomains(domain: str, cfg: dict, logger: logging.Logger) -> set[str]:
     else:
         logger.warning("assetfinder não encontrado  |  go install github.com/tomnomnom/assetfinder@latest")
 
-    # chaos
+    # chaos — passa a chave explicitamente com -key
     if tool_ok("chaos"):
-        logger.info("[chaos] …")
-        lines = run_cmd(["chaos", "-d", domain, "-silent"], logger, timeout=180)
-        subs.update(lines)
-        logger.info("[chaos] %d subs", len(lines))
+        if not chaos_key:
+            logger.warning("[chaos] pulando — CHAOS_KEY não definida.")
+        else:
+            logger.info("[chaos] …")
+            lines = run_cmd(
+                ["chaos", "-d", domain, "-key", chaos_key, "-silent"],
+                logger, timeout=180,
+            )
+            subs.update(lines)
+            logger.info("[chaos] %d subs", len(lines))
     else:
         logger.warning("chaos não encontrado  |  go install github.com/projectdiscovery/chaos-client/cmd/chaos@latest")
 
-    # github-subdomains
+    # github-subdomains — passa o token explicitamente com -t
     if tool_ok("github-subdomains"):
-        logger.info("[github-subdomains] …")
-        lines = run_cmd(["github-subdomains", "-d", domain, "-raw"], logger, timeout=120)
-        subs.update(lines)
-        logger.info("[github-subdomains] %d subs", len(lines))
+        if not github_token:
+            logger.warning("[github-subdomains] pulando — GITHUB_TOKEN não definido.")
+        else:
+            logger.info("[github-subdomains] …")
+            lines = run_cmd(
+                ["github-subdomains", "-d", domain, "-t", github_token, "-raw"],
+                logger, timeout=120,
+            )
+            subs.update(lines)
+            logger.info("[github-subdomains] %d subs", len(lines))
     else:
         logger.warning("github-subdomains não encontrado  |  go install github.com/gwen001/github-subdomains@latest")
 
