@@ -160,6 +160,11 @@ SECRET_SEVERITY: dict[str, str] = {
     "auth_header_hardcoded": "MEDIUM",
     "btoa_decoded":          "HIGH",
     "btoa_creds":            "HIGH",
+    "js_secret_key":         "CRITICAL",
+    "firebase_app_id":       "HIGH",
+    "firebase_sender_id":    "MEDIUM",
+    "firebase_measurement_id": "LOW",
+    "firebase_config_block": "HIGH",
 }
 _SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "UNKNOWN": 4}
 
@@ -285,6 +290,19 @@ def _secret_patterns() -> dict[str, re.Pattern]:
         "google_api_key":        _rx(r'AIza[0-9A-Za-z\-_]{35}'),
         "google_oauth_client":   _rx(r'[0-9]+-[0-9A-Za-z_]{32}\.apps\.googleusercontent\.com'),
         "firebase_url":          _rx(r'https?://[a-z0-9\-]+\.firebaseio\.com', re.I),
+        # ── Configurações de ambiente / Firebase / chaves de app ─────────────
+        # secretKey / secreteKey hardcoded em objeto de config JS
+        "js_secret_key":         _rx(r'secrete?[Kk]ey\s*[:=]\s*["\']([^"\']{6,})["\']', re.I),
+        # Firebase appId no formato "1:NNNN:web:HEX"
+        "firebase_app_id":       _rx(r'appId\s*[:=]\s*["\'](\d+:\d+:\w+:[a-f0-9]{16,})["\']', re.I),
+        # Firebase messagingSenderId
+        "firebase_sender_id":    _rx(r'messagingSenderId\s*[:=]\s*["\'](\d{8,})["\']', re.I),
+        # Firebase measurementId / Google Analytics
+        "firebase_measurement_id": _rx(r'measurementId\s*[:=]\s*["\']([A-Z0-9\-]{8,})["\']', re.I),
+        # Bloco de config Firebase completo (apiKey + authDomain juntos)
+        "firebase_config_block": _rx(r'apiKey\s*:\s*["\']([^"\']{20,})["\'][^}]{0,200}authDomain\s*:\s*["\']([^"\']+)["\']', re.I | re.DOTALL),
+        # environment.ts / config.js: chaves de ambiente genéricas minificadas
+        "env_config_key":        _rx(r'(?:apiUrl|baseUrl|endpointUrl|serviceUrl|backendUrl)\s*[:=]\s*["\']([^"\']{8,})["\']', re.I),
         "gcp_service_account":   _rx(r'"type"\s*:\s*"service_account"'),
         "aws_access_key":        _rx(r'AKIA[0-9A-Z]{16}'),
         "amazon_mws":            _rx(r'amzn\.mws\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'),
