@@ -5,9 +5,9 @@ HOST=$(echo $TARGET | sed 's|https\?://||' | cut -d'/' -f1)
 echo "[*] Iniciando interactsh-client..."
 interactsh-client -o /tmp/interactsh_output.txt &
 IACT_PID=$!
-sleep 5
+sleep 8
 
-IACT_DOMAIN=$(grep -oE '[a-z0-9]+\.oast\.[a-z]+' /tmp/interactsh_output.txt | head -1)
+IACT_DOMAIN=$(grep -oE '[a-z0-9]+\.oast\.[a-z]+' /tmp/interactsh_full.txt | head -1)
 
 if [ -z "$IACT_DOMAIN" ]; then
   echo "[!] Falha ao capturar domínio interactsh"
