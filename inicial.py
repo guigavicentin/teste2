@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 recon.py - Reconhecimento automatizado de subdomínios
-Ferramentas: chaos, github-subdomains, subfinder, assetfinder, nmap, httpx
+Ferramentas: chaos, github-subdomains, subfinder, assetfinder, nmap, httpx, shortscan
 """
 
 import subprocess
@@ -11,17 +11,34 @@ import re
 import json
 import shutil
 import argparse
+import threading
 from pathlib import Path
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ──────────────────────────────────────────────
 # CONFIGURAÇÕES
 # ──────────────────────────────────────────────
 PORTS = "80,81,3000,3001,8443,10000,9000,9443,443,8080,8000,6885,4443,2075,2076,6443,3868,3366,9091,5900,8081,6000,8181,3306,5000,4000,5432,15672,9999,161,4044,7077"
-HTTPX_THREADS = 80
+HTTPX_THREADS      = 80
+FINGERPRINT_THREADS = 20
+CURL_TIMEOUT       = 5   # segundos
 
-TOOLS_REQUIRED = ["subfinder", "assetfinder", "nmap", "httpx"]
-TOOLS_OPTIONAL = ["chaos", "github-subdomains"]
+# ── Caminhos dos scripts CVE (preencha aqui) ──
+NGINX_CVE_SCRIPT  = ""   # ex: "/opt/scripts/nginx_cve.py"
+APACHE_CVE_SCRIPT = ""   # ex: "/opt/scripts/apache_cve.py"
+
+TOOLS_REQUIRED = ["subfinder", "assetfinder", "nmap", "httpx", "curl"]
+TOOLS_OPTIONAL = ["chaos", "github-subdomains", "shortscan"]
+
+# Palavras-chave que indicam Cloudflare / WAF / sem identificação clara
+CLOUDFLARE_WAF_KEYWORDS = [
+    "cloudflare", "cloudfront", "sucuri", "incapsula", "imperva",
+    "akamai", "barracuda", "f5", "fastly", "waf", "firewall",
+]
+
+# Lock para log thread-safe
+_log_lock = threading.Lock()
 
 
 # ──────────────────────────────────────────────
@@ -38,16 +55,22 @@ def banner():
   ██║  ██║███████╗╚██████╗╚██████╔╝██║ ╚████║
   ╚═╝  ╚═╝╚══════╝ ╚═════╝ ╚═════╝ ╚═╝  ╚═══╝
 \033[0m
-  Subdomain Recon + Nmap + HTTPX
+  Subdomain Recon + Nmap + HTTPX + Fingerprint + CVE
 """)
 
 
 def log(msg, level="INFO"):
-    colors = {"INFO": "\033[1;34m", "OK": "\033[1;32m", "WARN": "\033[1;33m", "ERR": "\033[1;31m"}
+    colors = {
+        "INFO": "\033[1;34m",
+        "OK":   "\033[1;32m",
+        "WARN": "\033[1;33m",
+        "ERR":  "\033[1;31m",
+    }
     reset = "\033[0m"
-    c = colors.get(level, "")
+    c  = colors.get(level, "")
     ts = datetime.now().strftime("%H:%M:%S")
-    print(f"{c}[{level}] {ts} {msg}{reset}")
+    with _log_lock:
+        print(f"{c}[{level}] {ts} {msg}{reset}")
 
 
 def run_cmd(cmd, output_file=None, timeout=300):
@@ -158,7 +181,6 @@ def collect_subdomains(domain, outdir):
     all_subs += tmp
     log(f"github-subdomains: +{len(tmp)}", "OK")
 
-    # Filtra só subdomínios do alvo
     subs = dedup_sort([s for s in all_subs if domain in s])
     subs_file = f"{outdir}/subs_domain.txt"
     write_lines(subs_file, subs)
@@ -172,13 +194,13 @@ def collect_subdomains(domain, outdir):
 
 def run_nmap(subs_file, outdir):
     log("=== NMAP ===")
-    nmap_out = f"{outdir}/nmap_output.txt"
+    nmap_out   = f"{outdir}/nmap_output.txt"
     nmap_gnmap = f"{outdir}/nmap_output.gnmap"
 
     cmd = (
         f"nmap -iL {subs_file} "
         f"-p {PORTS} "
-        f"--open -T4 -n "
+        f"--open -T4 -n -sV "          # -sV para banner/version detection
         f"-oG {nmap_gnmap} "
         f"-oN {nmap_out} "
         f"--max-retries 2 "
@@ -188,22 +210,42 @@ def run_nmap(subs_file, outdir):
 
     if not Path(nmap_gnmap).exists():
         log("Nmap não gerou saída grepable", "WARN")
-        return {}
+        return {}, {}
 
     # Parse gnmap → {ip: [porta, ...]}
     results = {}
     for line in Path(nmap_gnmap).read_text().splitlines():
         if "Ports:" not in line:
             continue
-        # Ex: Host: 1.2.3.4 (sub.domain.com)  Ports: 80/open/tcp...
-        host_match = re.search(r"Host:\s+(\S+)", line)
+        host_match  = re.search(r"Host:\s+(\S+)", line)
         ports_match = re.findall(r"(\d+)/open/tcp", line)
         if host_match and ports_match:
             ip = host_match.group(1)
             results.setdefault(ip, set()).update(ports_match)
 
+    # Parse nmap normal output → {ip: server_banner}
+    # Ex: "80/tcp  open  http    nginx 1.18.0"
+    banners = {}
+    nmap_text = Path(nmap_out).read_text() if Path(nmap_out).exists() else ""
+    current_host = None
+    for line in nmap_text.splitlines():
+        host_line = re.match(r"Nmap scan report for (\S+)", line)
+        if host_line:
+            current_host = host_line.group(1)
+            # remove possível "(ip)" do final
+            current_host = re.sub(r"\s*\(.*\)", "", current_host).strip()
+            continue
+        if current_host:
+            # Captura linhas como: 80/tcp open http nginx 1.18.0
+            port_line = re.match(r"\s*(\d+)/tcp\s+open\s+\S+\s+(.*)", line)
+            if port_line:
+                service_info = port_line.group(2).strip().lower()
+                if service_info and current_host not in banners:
+                    banners[current_host] = service_info
+
     log(f"Nmap encontrou {len(results)} hosts com portas abertas", "OK")
-    return {k: sorted(v, key=int) for k, v in results.items()}
+    log(f"Nmap coletou {len(banners)} banners de serviço", "OK")
+    return {k: sorted(v, key=int) for k, v in results.items()}, banners
 
 
 # ──────────────────────────────────────────────
@@ -215,7 +257,6 @@ def run_httpx(subs_file, outdir):
     alive_file = f"{outdir}/alive.txt"
     alive_json = f"{outdir}/alive_json.txt"
 
-    # Roda httpx com saída JSON para parsear IPs e portas
     cmd = (
         f"httpx -l {subs_file} "
         f"-ports {PORTS} "
@@ -225,7 +266,6 @@ def run_httpx(subs_file, outdir):
     )
     run_cmd(cmd, timeout=900)
 
-    # Também salva formato simples
     cmd2 = (
         f"httpx -l {subs_file} "
         f"-ports {PORTS} "
@@ -238,13 +278,308 @@ def run_httpx(subs_file, outdir):
 
 
 # ──────────────────────────────────────────────
+# ALIVE DEDUP  (novo)
+# ──────────────────────────────────────────────
+
+def build_alive_dedup(alive_file, outdir):
+    """
+    Remove duplicatas http/https do alive.txt.
+    Prefere https quando ambos existem para o mesmo host:porta.
+    Salva em alive_dedup.txt.
+    """
+    if not Path(alive_file).exists():
+        log("alive.txt não encontrado, pulando dedup", "WARN")
+        return
+
+    lines = [l.strip() for l in Path(alive_file).read_text().splitlines() if l.strip()]
+
+    # Normaliza: extrai (host, porta) sem protocolo
+    seen   = {}   # (host, port) → url preferida (https > http)
+    for url in lines:
+        m = re.match(r"(https?)://([^/:]+)(?::(\d+))?", url)
+        if not m:
+            continue
+        scheme, host, port = m.group(1), m.group(2), m.group(3) or ("443" if m.group(1) == "https" else "80")
+        key = (host, port)
+        if key not in seen or scheme == "https":
+            seen[key] = url
+
+    dedup = sorted(seen.values())
+    out   = f"{outdir}/alive_dedup.txt"
+    write_lines(out, dedup)
+    log(f"alive_dedup.txt: {len(lines)} → {len(dedup)} (removidas {len(lines)-len(dedup)} duplicatas)", "OK")
+    return out
+
+
+# ──────────────────────────────────────────────
+# IPs ONLY  (novo)
+# ──────────────────────────────────────────────
+
+def build_ips_only(ip_port_file, outdir):
+    """
+    Extrai apenas os IPs de ips_ativos_portas.txt (sem porta).
+    Salva em ips_only.txt.
+    """
+    if not Path(ip_port_file).exists():
+        log("ips_ativos_portas.txt não encontrado, pulando ips_only", "WARN")
+        return
+
+    ips = set()
+    for line in Path(ip_port_file).read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Remove protocolo se houver
+        clean = re.sub(r"^https?://", "", line)
+        ip = clean.split(":")[0]
+        if ip:
+            ips.add(ip)
+
+    out = f"{outdir}/ips_only.txt"
+    write_lines(out, sorted(ips))
+    return out
+
+
+# ──────────────────────────────────────────────
+# FINGERPRINT DE SERVIDOR  (novo)
+# ──────────────────────────────────────────────
+
+def _classify_server(raw: str) -> str:
+    """
+    Classifica o valor bruto do header/banner em uma categoria.
+    Retorna: 'nginx' | 'apache' | 'iis' | 'cloudflare_waf' | 'outro:<valor>'
+    """
+    val = raw.lower().strip()
+
+    # Cloudflare / WAF primeiro (pode mascarar o servidor real)
+    for kw in CLOUDFLARE_WAF_KEYWORDS:
+        if kw in val:
+            return "cloudflare_waf"
+
+    if "nginx" in val:
+        return "nginx"
+    if "apache" in val:
+        return "apache"
+    if "microsoft-iis" in val or "iis" in val:
+        return "iis"
+    if val:
+        return f"outro:{val}"
+    return "desconhecido"
+
+
+def _fingerprint_url(url: str, nmap_banners: dict) -> tuple[str, str]:
+    """
+    Tenta identificar o servidor de uma URL.
+    Ordem: nmap banner → curl header Server → curl body de erro.
+    Retorna (host, classificacao).
+    """
+    m = re.match(r"https?://([^/:]+)", url)
+    if not m:
+        return url, "desconhecido"
+    host = m.group(1)
+
+    # 1. Banner do nmap
+    if host in nmap_banners:
+        banner_val = nmap_banners[host]
+        cls = _classify_server(banner_val)
+        if cls not in ("desconhecido",):
+            log(f"[fingerprint] {host} → {cls} (nmap banner)", "INFO")
+            return host, cls
+
+    # 2. curl header Server:
+    try:
+        result = subprocess.run(
+            f"curl -sk -o /dev/null -D - --max-time {CURL_TIMEOUT} {url}",
+            shell=True, capture_output=True, text=True, timeout=CURL_TIMEOUT + 2
+        )
+        for line in result.stdout.splitlines():
+            if line.lower().startswith("server:"):
+                server_val = line.split(":", 1)[1].strip()
+                cls = _classify_server(server_val)
+                if cls not in ("desconhecido",):
+                    log(f"[fingerprint] {host} → {cls} (curl header)", "INFO")
+                    return host, cls
+    except Exception:
+        pass
+
+    # 3. curl body de erro (path inexistente)
+    try:
+        error_url = url.rstrip("/") + "/____recon_probe_404____"
+        result = subprocess.run(
+            f"curl -sk --max-time {CURL_TIMEOUT} {error_url}",
+            shell=True, capture_output=True, text=True, timeout=CURL_TIMEOUT + 2
+        )
+        body = result.stdout.lower()
+        if "nginx" in body:
+            log(f"[fingerprint] {host} → nginx (curl body)", "INFO")
+            return host, "nginx"
+        if "apache" in body:
+            log(f"[fingerprint] {host} → apache (curl body)", "INFO")
+            return host, "apache"
+        if "microsoft-iis" in body or "iis" in body:
+            log(f"[fingerprint] {host} → iis (curl body)", "INFO")
+            return host, "iis"
+        for kw in CLOUDFLARE_WAF_KEYWORDS:
+            if kw in body:
+                log(f"[fingerprint] {host} → cloudflare_waf (curl body)", "INFO")
+                return host, "cloudflare_waf"
+    except Exception:
+        pass
+
+    log(f"[fingerprint] {host} → desconhecido", "WARN")
+    return host, "desconhecido"
+
+
+def run_fingerprint(alive_dedup_file, nmap_banners: dict, outdir: str) -> dict:
+    """
+    Roda fingerprint em paralelo em todos os hosts do alive_dedup.txt.
+    Retorna dict {host: classificacao}.
+    """
+    log("=== FINGERPRINT DE SERVIDOR ===")
+
+    if not alive_dedup_file or not Path(alive_dedup_file).exists():
+        log("alive_dedup.txt não encontrado, pulando fingerprint", "WARN")
+        return {}
+
+    urls = [l.strip() for l in Path(alive_dedup_file).read_text().splitlines() if l.strip()]
+    if not urls:
+        log("Nenhuma URL para fingerprint", "WARN")
+        return {}
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=FINGERPRINT_THREADS) as executor:
+        futures = {executor.submit(_fingerprint_url, url, nmap_banners): url for url in urls}
+        for future in as_completed(futures):
+            host, cls = future.result()
+            # Guarda apenas a melhor classificação por host (nginx/apache > cloudflare > desconhecido)
+            priority = {"nginx": 0, "apache": 0, "iis": 0, "cloudflare_waf": 1, "desconhecido": 2}
+            existing = results.get(host)
+            if existing is None:
+                results[host] = cls
+            else:
+                p_new = priority.get(cls, 0) if not cls.startswith("outro:") else 0
+                p_old = priority.get(existing, 0) if not existing.startswith("outro:") else 0
+                if p_new < p_old:
+                    results[host] = cls
+
+    # Salva log de fingerprint
+    fp_lines = [f"{host} - {cls}" for host, cls in sorted(results.items())]
+    fp_file  = f"{outdir}/server_fingerprint.txt"
+    write_lines(fp_file, fp_lines)
+    log(f"Fingerprint salvo em: {fp_file}", "OK")
+
+    # Resumo por categoria
+    from collections import Counter
+    counts = Counter(
+        (c if not c.startswith("outro:") else "outro") for c in results.values()
+    )
+    for cat, n in sorted(counts.items()):
+        log(f"  {cat}: {n} host(s)", "OK")
+
+    return results
+
+
+# ──────────────────────────────────────────────
+# EXECUÇÃO DOS SCRIPTS CVE / SHORTSCAN  (novo)
+# ──────────────────────────────────────────────
+
+def _run_script(script_path: str, url: str, label: str):
+    """Executa um script externo passando a URL como argumento."""
+    if not script_path:
+        log(f"Caminho do script {label} não configurado (edite NGINX_CVE_SCRIPT / APACHE_CVE_SCRIPT)", "WARN")
+        return
+    if not Path(script_path).exists():
+        log(f"Script {label} não encontrado: {script_path}", "ERR")
+        return
+    log(f"Executando {label} em {url}")
+    run_cmd(f"python3 {script_path} {url}", timeout=300)
+
+
+def _run_shortscan(url: str):
+    """Executa shortscan em uma URL."""
+    if not tool_available("shortscan"):
+        log("shortscan não instalado — pulando IIS scan", "WARN")
+        return
+    log(f"Executando shortscan em {url}")
+    run_cmd(f"shortscan {url}", timeout=120)
+
+
+def dispatch_cve_scripts(
+    fingerprint: dict,
+    alive_dedup_file: str,
+    no_nginx: bool,
+    no_apache: bool,
+    no_iis: bool,
+):
+    """
+    Para cada host identificado, executa o script CVE correspondente.
+    Usa as URLs do alive_dedup para ter protocolo+porta corretos.
+    """
+    log("=== EXECUÇÃO DE SCRIPTS CVE ===")
+
+    if not alive_dedup_file or not Path(alive_dedup_file).exists():
+        log("alive_dedup.txt não encontrado, pulando CVE dispatch", "WARN")
+        return
+
+    # Mapeia host → lista de URLs (pode ter porta não-padrão)
+    host_urls: dict[str, list[str]] = {}
+    for line in Path(alive_dedup_file).read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        m = re.match(r"https?://([^/:]+)", line)
+        if m:
+            host_urls.setdefault(m.group(1), []).append(line)
+
+    for host, cls in sorted(fingerprint.items()):
+        urls = host_urls.get(host, [f"http://{host}"])
+
+        for url in urls:
+            if cls == "nginx":
+                if no_nginx:
+                    log(f"[CVE] {host} → nginx (--no-nginx ativo, pulando)", "WARN")
+                else:
+                    log(f"[CVE] {host} → nginx", "OK")
+                    _run_script(NGINX_CVE_SCRIPT, url, "nginx_cve")
+
+            elif cls == "apache":
+                if no_apache:
+                    log(f"[CVE] {host} → apache (--no-apache ativo, pulando)", "WARN")
+                else:
+                    log(f"[CVE] {host} → apache", "OK")
+                    _run_script(APACHE_CVE_SCRIPT, url, "apache_cve")
+
+            elif cls == "iis":
+                if no_iis:
+                    log(f"[CVE] {host} → IIS (--no-iis ativo, pulando)", "WARN")
+                else:
+                    log(f"[CVE] {host} → IIS", "OK")
+                    _run_shortscan(url)
+
+            elif cls in ("cloudflare_waf", "desconhecido"):
+                log(f"[CVE] {host} → {cls} → rodando nginx + apache", "WARN")
+                if not no_nginx:
+                    _run_script(NGINX_CVE_SCRIPT, url, "nginx_cve")
+                else:
+                    log(f"[CVE] nginx pulado (--no-nginx)", "WARN")
+                if not no_apache:
+                    _run_script(APACHE_CVE_SCRIPT, url, "apache_cve")
+                else:
+                    log(f"[CVE] apache pulado (--no-apache)", "WARN")
+
+            elif cls.startswith("outro:"):
+                servidor = cls.split(":", 1)[1]
+                log(f"[CVE] {host} → servidor identificado: {servidor} (sem script disponível)", "INFO")
+
+            else:
+                log(f"[CVE] {host} → classificação inesperada: {cls}", "WARN")
+
+
+# ──────────────────────────────────────────────
 # PARSE & CONSOLIDAÇÃO
 # ──────────────────────────────────────────────
 
 def parse_httpx_json(alive_json):
-    """
-    Retorna lista de dicts com: url, host, ip, port, scheme
-    """
     entries = []
     if not Path(alive_json).exists():
         return entries
@@ -254,7 +589,7 @@ def parse_httpx_json(alive_json):
         if not line:
             continue
         try:
-            obj = json.loads(line)
+            obj    = json.loads(line)
             url    = obj.get("url", "")
             host   = obj.get("host", obj.get("input", ""))
             ip     = obj.get("a", [""])[0] if obj.get("a") else obj.get("ip", "")
@@ -269,12 +604,9 @@ def parse_httpx_json(alive_json):
 
 
 def build_output_files(entries, nmap_results, outdir):
-    """
-    Gera os arquivos finais de saída.
-    """
     log("=== GERANDO ARQUIVOS DE SAÍDA ===")
 
-    # ── 1. Subdomínios ativos + portas (ex: sub.domain.com:80)
+    # ── 1. Subdomínios ativos + portas
     sub_ports = set()
     for e in entries:
         host = e["host"]
@@ -282,13 +614,11 @@ def build_output_files(entries, nmap_results, outdir):
         if host and port:
             sub_ports.add(f"{host}:{port}")
 
-    # Complementa com nmap (domínios resolvidos nos resultados)
-    # (nmap pode ter IPs; sub_ports já vem do httpx)
-
     sub_ports_file = f"{outdir}/subdominios_ativos_portas.txt"
     write_lines(sub_ports_file, sorted(sub_ports))
 
-    # ── 2. IPs com http/https (ex: http://1.2.3.4:80 ou https://1.2.3.4:443)
+    # ── 2. IPs com http/https
+    SSL_PORTS = {"443", "8443", "9443", "6443", "4443", "2076", "10000"}
     ip_url_set = set()
     for e in entries:
         ip     = e["ip"]
@@ -297,8 +627,6 @@ def build_output_files(entries, nmap_results, outdir):
         if ip and port:
             ip_url_set.add(f"{scheme}://{ip}:{port}")
 
-    # Complementa com nmap (hosts sem httpx confirmado)
-    SSL_PORTS = {"443", "8443", "9443", "6443", "4443", "2076", "10000"}
     for ip, ports in nmap_results.items():
         for p in ports:
             scheme = "https" if p in SSL_PORTS else "http"
@@ -307,22 +635,14 @@ def build_output_files(entries, nmap_results, outdir):
     ip_url_file = f"{outdir}/ips_ativos_com_protocolo.txt"
     write_lines(ip_url_file, sorted(ip_url_set))
 
-    # ── 3. IPs + porta simples (sem protocolo) ex: 1.2.3.4:80
+    # ── 3. IPs + porta simples
     ip_port_set = set()
     for entry in ip_url_set:
-        # Remove scheme
         clean = re.sub(r"^https?://", "", entry)
         ip_port_set.add(clean)
 
     ip_port_file = f"{outdir}/ips_ativos_portas.txt"
     write_lines(ip_port_file, sorted(ip_port_set))
-
-    # ── Resumo
-    print()
-    log("══════════════ RESUMO ══════════════", "OK")
-    log(f"Subdomínios ativos + portas : {sub_ports_file}", "OK")
-    log(f"IPs com protocolo           : {ip_url_file}", "OK")
-    log(f"IPs + porta (simples)       : {ip_port_file}", "OK")
 
     return sub_ports_file, ip_url_file, ip_port_file
 
@@ -333,7 +653,7 @@ def build_output_files(entries, nmap_results, outdir):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Recon automatizado: subdomínios → nmap → httpx"
+        description="Recon automatizado: subdomínios → nmap → httpx → fingerprint → CVE"
     )
     parser.add_argument("domain", help="Domínio alvo (ex: exemplo.com.br)")
     parser.add_argument(
@@ -342,11 +662,27 @@ def main():
     )
     parser.add_argument(
         "--skip-nmap", action="store_true",
-        help="Pula o nmap (útil se já tiver subs_domain.txt)"
+        help="Pula o nmap"
+    )
+    parser.add_argument(
+        "--skip-fingerprint", action="store_true",
+        help="Pula a etapa de fingerprint de servidor"
     )
     parser.add_argument(
         "--subs-file", default=None,
         help="Usa arquivo de subdomínios existente (pula coleta)"
+    )
+    parser.add_argument(
+        "--no-nginx", action="store_true",
+        help="Não executa o script CVE de Nginx"
+    )
+    parser.add_argument(
+        "--no-apache", action="store_true",
+        help="Não executa o script CVE de Apache"
+    )
+    parser.add_argument(
+        "--no-iis", action="store_true",
+        help="Não executa shortscan em hosts IIS"
     )
     args = parser.parse_args()
 
@@ -377,8 +713,9 @@ def main():
 
     # 2. Nmap
     nmap_results = {}
+    nmap_banners = {}
     if not args.skip_nmap:
-        nmap_results = run_nmap(subs_file, outdir)
+        nmap_results, nmap_banners = run_nmap(subs_file, outdir)
     else:
         log("Nmap pulado (--skip-nmap)", "WARN")
 
@@ -389,8 +726,40 @@ def main():
     entries = parse_httpx_json(alive_json)
     log(f"HTTPX retornou {len(entries)} URLs ativas", "OK")
 
-    build_output_files(entries, nmap_results, outdir)
+    sub_ports_file, ip_url_file, ip_port_file = build_output_files(entries, nmap_results, outdir)
 
+    # 5. Alive dedup (novo)
+    alive_dedup_file = build_alive_dedup(alive_file, outdir)
+
+    # 6. IPs only (novo)
+    build_ips_only(ip_port_file, outdir)
+
+    # 7. Fingerprint (novo)
+    fingerprint = {}
+    if not args.skip_fingerprint:
+        fingerprint = run_fingerprint(alive_dedup_file, nmap_banners, outdir)
+    else:
+        log("Fingerprint pulado (--skip-fingerprint)", "WARN")
+
+    # 8. Dispatch CVE scripts (novo)
+    if fingerprint:
+        dispatch_cve_scripts(
+            fingerprint,
+            alive_dedup_file,
+            no_nginx=args.no_nginx,
+            no_apache=args.no_apache,
+            no_iis=args.no_iis,
+        )
+
+    # Resumo final
+    print()
+    log("══════════════ RESUMO ══════════════", "OK")
+    log(f"Subdomínios ativos + portas : {sub_ports_file}", "OK")
+    log(f"IPs com protocolo           : {ip_url_file}", "OK")
+    log(f"IPs + porta (simples)       : {ip_port_file}", "OK")
+    log(f"Alive dedup                 : {outdir}/alive_dedup.txt", "OK")
+    log(f"IPs only                    : {outdir}/ips_only.txt", "OK")
+    log(f"Fingerprint de servidor     : {outdir}/server_fingerprint.txt", "OK")
     print()
     log(f"Recon finalizado! Resultados em: {outdir}/", "OK")
 
