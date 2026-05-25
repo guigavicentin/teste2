@@ -549,11 +549,13 @@ def _inject_one(task: dict, session, plog: PayloadLog, oob_host: str,
             "X-Forwarded-For": f"{oob_host}",
         }
 
+    sent_at = datetime.now(timezone.utc).strftime("%H:%M:%S")   # HH:MM:SS UTC
     plog.record(uid, task["url"], task["param"], task["category"], payload)
     code = send_payload(session, injected_url, headers)
 
     return {
         "uid":      uid,
+        "sent_at":  sent_at,   # horário exato do envio — para cruzar com interactsh
         "category": task["category"],
         "param":    task["param"],
         "url":      task["url"][:70],
@@ -630,8 +632,8 @@ def phase_inject(category_files: dict[str, Path], oob_host: str, out: Path,
                 res = fut.result()
                 sent += 1
                 color = C.GREEN if res["code"] in ("200","201","301","302") else C.DIM
-                log(f"  [{res['uid'][:30]}] {res['param']:12} HTTP {res['code']} "
-                    f"→ {res['url']}", color)
+                log(f"  {res['sent_at']} [{res['uid'][:30]}] {res['param']:12} "
+                    f"HTTP {res['code']} → {res['url']}", color)
                 with open(results_file, "a", encoding="utf-8") as f:
                     f.write(json.dumps(res) + "\n")
             except Exception as e:
@@ -677,46 +679,93 @@ def _monitor_loop(oob_host: str, plog: PayloadLog,
 
     log("  Iniciando interactsh-client...", C.CYAN)
 
+    # ── Notas sobre o interactsh-client v1.3+: ────────────────────────────
+    # • Linhas [INF]/[WRN]/[ERR] vão para STDOUT (não só stderr)
+    # • O JSON de cada hit também vai para STDOUT
+    # • O campo "timestamp" já está no JSON do hit (RFC3339 com nanosegundos)
+    # • Usar -server apenas quando o host não termina em oast.* (servidor público)
+    # ──────────────────────────────────────────────────────────────────────
+    cmd = ["interactsh-client", "-json", "-poll-interval", "5"]
+    # Se o usuário informou um host customizado (não é o padrão interactsh)
+    # usa -server. Para oast.fun / oast.me o cliente conecta por conta própria.
+    if not re.search(r"oast\.(fun|me|live|online)", oob_host):
+        cmd += ["-server", oob_host]
+
     proc = subprocess.Popen(
-        ["interactsh-client", "-server", oob_host,
-         "-json", "-poll-interval", "5"],
+        cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        bufsize=1,          # line-buffered
     )
 
-    # Thread que drena stderr (evita deadlock e captura erros de auth)
+    # Thread que drena stderr — alguns builds ainda usam stderr para [INF]
     def drain_stderr():
-        for line in proc.stderr:
-            line = line.strip()
-            if line:
-                log(f"  [interactsh] {line}", C.DIM, "debug")
-                if any(k in line.lower() for k in ("error", "failed", "invalid")):
-                    log(f"  ⚠ interactsh: {line}", C.YELLOW, "warning")
-    threading.Thread(target=drain_stderr, daemon=True).start()
+        for raw in proc.stderr:
+            raw = raw.strip()
+            if not raw:
+                continue
+            # Mostra [INF] normalmente, destaca erros
+            lvl  = "debug"
+            color = C.DIM
+            low  = raw.lower()
+            if any(k in low for k in ("error", "failed", "invalid", "refused")):
+                lvl   = "warning"
+                color = C.YELLOW
+            log(f"  [interactsh] {raw}", color, lvl)
+
+    threading.Thread(target=drain_stderr, daemon=True, name="iactsh-stderr").start()
+
+    # Contagem regressiva visível no terminal
+    def _countdown():
+        remaining = duration
+        while remaining > 0 and proc.poll() is None:
+            time.sleep(10)
+            remaining -= 10
+            if remaining > 0:
+                log(f"  ⏱  {remaining}s restantes no monitor...", C.DIM)
+    threading.Thread(target=_countdown, daemon=True, name="iactsh-timer").start()
 
     start  = time.time()
     hits: list[dict] = []
 
     try:
         while time.time() - start < duration:
-            # Leitura com timeout para não bloquear para sempre
-            proc.stdout.flush()
             line = proc.stdout.readline()
+
+            # Processo encerrou e não há mais output
             if not line:
                 if proc.poll() is not None:
                     log("  interactsh-client encerrou inesperadamente.", C.RED, "error")
                     break
-                time.sleep(0.5)
+                time.sleep(0.3)
                 continue
 
             line = line.strip()
             if not line:
                 continue
 
+            # ── v1.3+ mistura [INF]/[WRN]/[DBG] com JSON no stdout ────────
+            # Filtra linhas que claramente não são JSON
+            if line.startswith("["):
+                # Pode ser [INF], [WRN], [ERR], [DBG] — exibe e continua
+                low = line.lower()
+                if any(k in low for k in ("error", "failed", "invalid")):
+                    log(f"  ⚠ {line}", C.YELLOW, "warning")
+                else:
+                    log(f"  {line}", C.DIM, "debug")
+                continue
+
+            # Tenta parsear como JSON do hit
             try:
                 data = json.loads(line)
             except json.JSONDecodeError:
+                # Linha inesperada — loga em debug e segue
+                log(f"  [stdout não-JSON] {line[:120]}", C.DIM, "debug")
+                continue
+
+            # Só processa se tiver os campos esperados de um hit
+            if "protocol" not in data and "unique-id" not in data:
                 continue
 
             _process_hit(data, plog, hits, hits_file)
@@ -732,52 +781,111 @@ def _monitor_loop(oob_host: str, plog: PayloadLog,
 
     _write_summary(hits, plog, summary_file)
 
+def _parse_interactsh_ts(ts_str: str) -> Optional[float]:
+    """
+    Converte o campo timestamp do interactsh (RFC3339 com nanosegundos)
+    para float unix timestamp.
+    Ex: "2026-05-25T15:33:20.106317855Z" → 1748183600.106317
+    Python's fromisoformat não aceita nanosegundos — trunca para microssegundos.
+    """
+    if not ts_str:
+        return None
+    try:
+        # Trunca nanosegundos para microssegundos (6 dígitos)
+        ts_norm = re.sub(r'(\.\d{6})\d+(Z?)$', r'\1\2', ts_str)
+        ts_norm = ts_norm.replace("Z", "+00:00")
+        return datetime.fromisoformat(ts_norm).timestamp()
+    except Exception:
+        return None
+
+
 def _process_hit(data: dict, plog: PayloadLog,
                  hits: list, hits_file: Path):
+    """
+    Processa um hit JSON do interactsh-client v1.3+.
+
+    Campos relevantes no JSON real:
+      protocol      : "dns" | "http" | "smtp" | ...
+      unique-id     : ID base do host interactsh
+      full-id       : ID completo (pode incluir subpath do payload)
+      q-type        : "A" | "AAAA" | "MX" ... (DNS)
+      raw-request   : string com a requisição recebida
+      remote-address: IP de quem fez a requisição OOB
+      timestamp     : RFC3339 com nanosegundos — quando o hit chegou
+    """
     raw_id      = data.get("full-id", data.get("unique-id", ""))
     protocol    = data.get("protocol", "unknown").upper()
     remote_addr = data.get("remote-address", "?")
     raw_request = data.get("raw-request", "")
-    received_at = datetime.now(timezone.utc).isoformat()
+    q_type      = data.get("q-type", "")          # só DNS
+
+    # ── Timestamp: prefere o do JSON (preciso), fallback para now() ───────
+    hit_ts_str  = data.get("timestamp", "")
+    hit_ts_unix = _parse_interactsh_ts(hit_ts_str) or time.time()
+    received_at = hit_ts_str or datetime.now(timezone.utc).isoformat()
+
+    # Para DNS, exibe o tipo de query
+    proto_label = f"{protocol}/{q_type}" if q_type else protocol
 
     log(f"\n{'━'*60}", C.RED + C.BOLD)
-    log(f"  🎯  OOB HIT!", C.RED + C.BOLD)
-    log(f"  Protocolo  : {protocol}",    C.YELLOW)
-    log(f"  Remote IP  : {remote_addr}", C.YELLOW)
-    log(f"  ID         : {raw_id}",      C.YELLOW)
-    log(f"  Recebido   : {received_at}", C.YELLOW)
+    log(f"  🎯  OOB HIT RECEBIDO!", C.RED + C.BOLD)
+    log(f"  Protocolo  : {proto_label}",  C.YELLOW)
+    log(f"  Remote IP  : {remote_addr}",  C.YELLOW)
+    log(f"  Full-ID    : {raw_id}",       C.YELLOW)
+    log(f"  Timestamp  : {received_at}",  C.YELLOW)
 
+    # Mostra primeira linha da requisição (HTTP) ou query DNS
     if raw_request:
-        # Mostra primeira linha da requisição recebida
         first_line = raw_request.split("\n")[0].strip()
-        log(f"  Request    : {first_line[:100]}", C.YELLOW)
+        if first_line:
+            log(f"  Request    : {first_line[:120]}", C.YELLOW)
 
+    # ── Correlação com payload enviado ────────────────────────────────────
+    # find_fuzzy procura o UID embutido no subpath do full-id
+    # Ex: full-id = "xss-17480523102345-a3f9c2-srch.abc.oast.fun"
+    #     → encontra uid "xss-17480523102345-a3f9c2-srch" no payload_log
     matched = plog.find_fuzzy(raw_id)
 
+    delay_str = "?"
     if matched:
-        delay_ms = int(time.time() * 1000) - matched["unix_ts"]
-        delay_str = f"{delay_ms/1000:.1f}s"
+        # Delay = timestamp do hit (do JSON) − unix_ts do payload (ms → s)
+        sent_ts_unix = matched["unix_ts"] / 1000.0
+        delay_s      = hit_ts_unix - sent_ts_unix
+        # Delay negativo = hit chegou antes de registrar (improvável) ou clock skew
+        if delay_s < 0:
+            delay_str = f"~{abs(delay_s):.1f}s (clock skew?)"
+        elif delay_s > 3600:
+            delay_str = f"{delay_s/3600:.1f}h"
+        elif delay_s > 60:
+            delay_str = f"{delay_s/60:.1f}min"
+        else:
+            delay_str = f"{delay_s:.1f}s"
 
         log(f"\n  ✅ Payload correlacionado!", C.GREEN + C.BOLD)
-        log(f"  Categoria  : {matched['category']}", C.GREEN)
-        log(f"  URL        : {matched['url']}", C.GREEN)
-        log(f"  Parâmetro  : {matched['param']}", C.GREEN)
-        log(f"  Enviado em : {matched['timestamp']}", C.GREEN)
-        log(f"  Delay      : {delay_str} após envio", C.GREEN)
-        log(f"  Payload    : {matched['payload'][:100]}", C.GREEN)
+        log(f"  Categoria  : {matched['category']}",         C.GREEN)
+        log(f"  URL        : {matched['url']}",               C.GREEN)
+        log(f"  Parâmetro  : {matched['param']}",             C.GREEN)
+        log(f"  Enviado em : {matched['timestamp']}",         C.GREEN)
+        log(f"  Hit em     : {received_at}",                  C.GREEN)
+        log(f"  ⏱  Delay   : {delay_str} após envio",        C.GREEN + C.BOLD)
+        log(f"  Payload    : {matched['payload'][:120]}",     C.GREEN)
     else:
-        log("  ⚠  UID não encontrado no log — hit de outra fonte ou payload externo.",
-            C.YELLOW, "warning")
-        log(f"  Dica: grep '{raw_id[:20]}' {hits_file.parent}/payload_log.jsonl",
-            C.DIM)
+        log("  ⚠  UID não encontrado no payload_log.", C.YELLOW, "warning")
+        log("     Possíveis causas:", C.DIM)
+        log("       • Hit de sessão anterior (use --poll para recarregar log)", C.DIM)
+        log("       • DNS warmup do próprio interactsh (normal nos primeiros hits)", C.DIM)
+        log("       • Payload enviado por outra ferramenta", C.DIM)
+        log(f"     Buscar: grep '{raw_id[:24]}' {hits_file.parent}/payload_log.jsonl", C.DIM)
 
     hit = {
-        "received_at":   received_at,
-        "protocol":      protocol,
-        "remote_addr":   remote_addr,
-        "raw_id":        raw_id,
-        "raw_request":   raw_request[:500],
-        "matched_entry": matched,
+        "received_at":    received_at,
+        "hit_ts_unix":    hit_ts_unix,
+        "protocol":       proto_label,
+        "remote_addr":    remote_addr,
+        "raw_id":         raw_id,
+        "delay_str":      delay_str,
+        "raw_request":    raw_request[:500],
+        "matched_entry":  matched,
     }
     hits.append(hit)
     with open(hits_file, "a", encoding="utf-8") as f:
@@ -829,6 +937,7 @@ def _write_summary(hits: list, plog: PayloadLog, summary_file: Path):
                 f"    Protocolo  : {h['protocol']}",
                 f"    Remote IP  : {h['remote_addr']}",
                 f"    Recebido   : {h['received_at']}",
+                f"    Delay      : {h.get('delay_str', '?')} após envio",
                 f"    Categoria  : {m.get('category','?')}",
                 f"    URL        : {m.get('url','?')}",
                 f"    Parâmetro  : {m.get('param','?')}",
