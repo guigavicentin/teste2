@@ -572,28 +572,74 @@ def phase_inject(category_files: dict[str, Path], oob_host: str, out: Path,
 
     # Monta fila de tasks
     tasks: list[dict] = []
+
+    # Deduplicação global por (category, host+path, param)
+    # Garante que o mesmo endpoint não seja testado N vezes só porque
+    # o gau/gospider/waybackurls coletaram a mesma URL com valores
+    # de parâmetro diferentes.
+    # Ex: /embed?url=site1.com  /embed?url=site2.com  → mesmo endpoint base
+    _seen_tasks: set[tuple] = set()
+
+    def _url_base(url: str) -> str:
+        """Normaliza URL para deduplicação: mantém scheme+host+path, descarta valores de QS."""
+        try:
+            p = urllib.parse.urlparse(url)
+            # Mantém os *nomes* dos parâmetros mas zera os valores
+            params = sorted(urllib.parse.parse_qs(p.query, keep_blank_values=True).keys())
+            normalized_qs = "&".join(f"{k}=" for k in params)
+            return urllib.parse.urlunparse(p._replace(query=normalized_qs, fragment=""))
+        except Exception:
+            return url
+
     for category, gf_file in category_files.items():
         if category not in PAYLOADS or not gf_file.exists():
             continue
-        urls = [u.strip() for u in gf_file.read_text().splitlines() if u.strip()]
-        # Deduplica URLs dentro da categoria
-        urls = list(dict.fromkeys(urls))
 
-        for url in urls:
+        raw_urls = [u.strip() for u in gf_file.read_text().splitlines() if u.strip()]
+
+        # Primeiro dedup exato (remove cópias 100% idênticas)
+        raw_urls = list(dict.fromkeys(raw_urls))
+
+        # Segundo dedup por base de URL + categoria
+        # Mantém a primeira URL encontrada para cada base única
+        seen_bases: dict[str, str] = {}   # base → url representativa
+        for url in raw_urls:
+            base = _url_base(url)
+            key  = (category, base)
+            if key not in seen_bases:
+                seen_bases[key] = url
+
+        deduped_urls = list(seen_bases.values())
+        skipped = len(raw_urls) - len(deduped_urls)
+        if skipped:
+            log(f"  [{category.upper():8}] {len(deduped_urls)} endpoints únicos "
+                f"({skipped} duplicatas de base descartadas)", C.DIM)
+
+        for url in deduped_urls:
             params = extract_params(url)
             if not params:
                 params = ["__path__"]
 
             for param in params:
                 for tpl in PAYLOADS[category]:
+                    # Dedup global: (category, url_base, param, template_index)
+                    tpl_key = (category, _url_base(url), param,
+                               PAYLOADS[category].index(tpl))
+                    if tpl_key in _seen_tasks:
+                        continue
+                    _seen_tasks.add(tpl_key)
                     tasks.append({
                         "url": url, "param": param,
                         "category": category, "payload_template": tpl,
                     })
 
-            # Injeção via headers para categorias sensíveis
+            # Injeção via headers — dedup por (category_hdr, url_base, header)
             if category in ("ssrf", "rce", "lfi", "xxe"):
                 for hdr_name, hdr_tpl in OOB_HEADERS:
+                    hdr_key = (f"{category}_hdr", _url_base(url), hdr_name)
+                    if hdr_key in _seen_tasks:
+                        continue
+                    _seen_tasks.add(hdr_key)
                     tasks.append({
                         "url": url, "param": "__header__",
                         "category": f"{category}_hdr",
