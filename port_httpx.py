@@ -175,22 +175,21 @@ def resolve_ips(subs_file, outdir):
         log_info("Resolvendo com dnsx...")
         # -a retorna registros A, -resp mostra a resposta (suportado na maioria das versões)
         # Tenta com -resp primeiro, fallback sem ele
-        out, rc = run(["dnsx", "-l", str(subs_file), "-a", "-resp", "-silent"])
+        out, rc = run(["dnsx", "-l", str(subs_file), "-a", "-resp", "-silent", "-no-color"])
         if not out.strip():
-            out, rc = run(["dnsx", "-l", str(subs_file), "-a", "-silent"])
+            out, rc = run(["dnsx", "-l", str(subs_file), "-a", "-silent", "-no-color"])
         Path(dns_resolved).write_text(out + "\n")
 
         import re
+        # Remove ANSI color codes do output do dnsx antes de parsear
+        ansi_escape = re.compile(r'\[[0-9;]*m')
         for line in out.splitlines():
-            # Formato dnsx: "sub.domain.com [A] [1.2.3.4]"
-            # Captura todos os IPs válidos na linha independente do formato
-            matches = re.findall(r'\[(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\]', line)
+            clean = ansi_escape.sub('', line)
+            matches = re.findall(r'\[(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\]', clean)
             if not matches:
-                # Fallback: captura IP sem colchetes
-                matches = re.findall(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})', line)
+                matches = re.findall(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})', clean)
             for ip in matches:
                 parts = list(map(int, ip.split(".")))
-                # Exclui loopback e link-local
                 if parts[0] == 127 or (parts[0] == 169 and parts[1] == 254):
                     continue
                 ips_raw.append(ip)
