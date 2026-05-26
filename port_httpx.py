@@ -182,15 +182,16 @@ def resolve_ips(subs_file, outdir):
 
         import re
         for line in out.splitlines():
-            # Captura IPs em qualquer formato de saída do dnsx
-            matches = re.findall(r'\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b', line)
-            # Filtra IPs privados/loopback se quiser só públicos
+            # Formato dnsx: "sub.domain.com [A] [1.2.3.4]"
+            # Captura todos os IPs válidos na linha independente do formato
+            matches = re.findall(r'\[(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\]', line)
+            if not matches:
+                # Fallback: captura IP sem colchetes
+                matches = re.findall(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})', line)
             for ip in matches:
                 parts = list(map(int, ip.split(".")))
-                # Exclui loopback, link-local e private ranges óbvios
-                if parts[0] in (127, 0, 169) and parts[1] == 254:
-                    continue
-                if parts[0] == 127:
+                # Exclui loopback e link-local
+                if parts[0] == 127 or (parts[0] == 169 and parts[1] == 254):
                     continue
                 ips_raw.append(ip)
         log_ok(f"dnsx resolveu {count_lines(dns_resolved)} entradas")
